@@ -41,7 +41,7 @@ with st.sidebar:
     1. 上傳 Excel 公版 (`.xlsx`)
     2. 批次上傳掃描 PDF 解款單
     3. 點擊「開始辨識與填表」
-    4. 檢視**平衡勾稽核對表**（確認 自輸-總計=0）
+    4. 檢視**平衡勾稽核對表**（確認 自輸 - 總計 = 0）
     5. 下載填寫完成的 Excel 報表
     """)
 
@@ -77,7 +77,7 @@ def to_clean_num(val):
 def build_subtraction_value_or_formula(pos_val, neg_val):
     """
     依需求建構公式：
-    - 若兩者皆為 0 ➜ 返回 None（不填）
+    - 若兩者皆為 0 ➜ 返回 None（不填入）
     - 若有正有負 ➜ 生成 Excel 公式 =正數-負數
     - 若僅有正數 ➜ 填入正數數值
     - 若僅有負數 ➜ 生成 Excel 公式 =-負數
@@ -93,9 +93,7 @@ def build_subtraction_value_or_formula(pos_val, neg_val):
     return p
 
 def analyze_sheet_structure(sheet):
-    """
-    智慧掃描 Excel 工作表表頭，動態抓取欄位索引
-    """
+    """智慧掃描 Excel 工作表表頭，動態抓取欄位索引"""
     col_map = {}
     for r in range(1, 8):
         for c in range(1, sheet.max_column + 1):
@@ -133,9 +131,7 @@ def analyze_sheet_structure(sheet):
     return col_map
 
 def find_target_row(sheet, date_day, date_col=1):
-    """
-    在工作表的日期欄中找到對應日期的列號 (1~31)
-    """
+    """在工作表的日期欄中找到對應日期的列號 (1~31)"""
     for r in range(1, 50):
         val = sheet.cell(row=r, column=date_col).value
         if val is not None:
@@ -145,8 +141,15 @@ def find_target_row(sheet, date_day, date_col=1):
                     return r
             except Exception:
                 pass
-    # 若找不到，採用標準偏移保底（表頭通常佔 1~2 列）
     return int(date_day) + 1
+
+def write_cell_if_valid(sheet, row_idx, col_idx, val):
+    """寫入儲存格函式：數值為 0 或空值時不填入，成功寫入回傳 1，否則回傳 0"""
+    if val is not None and val != 0 and val != "0" and val != "":
+        if col_idx:
+            sheet.cell(row=row_idx, column=col_idx, value=val)
+            return 1
+    return 0
 
 # ----------------------------------------------------
 # 3. 檔案上傳介面
@@ -178,7 +181,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         st.error(f"❌ Excel 讀取失敗，請確認檔案格式為有效的 .xlsx 檔：{e}")
         st.stop()
 
-    # 階段 1：使用 pypdf 拆解 PDF 單頁（純 Python，免裝 Poppler）
+    # 階段 1：使用 pypdf 拆解 PDF 單頁
     status_box = st.status("📄 [階段 1/2] 正在讀取與拆分 PDF 頁面...", expanded=True)
     all_pages = []
     
@@ -204,7 +207,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     status_box.update(label=f"🚀 [階段 2/2] 正在辨識 {total_tasks} 頁解款單據並填寫 Excel...", state="running")
     
     prompt = """
-    你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據影像/PDF：
+    你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據：
     1. 擷取【車站名稱】（如：豐富、苗栗、三義、新竹等）與報表【日期】（僅需日/號數，1-31 的整數）。
     2. 專注看左側【應解款數】大項目區塊，精確擷取各數值（若無或空白填 0）：
        - 客運
@@ -263,7 +266,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         else:
             status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:60]}...)")
         
-        # 避免 API 瞬間速率限制
         time.sleep(1.0)
 
     # ----------------------------------------------------
@@ -314,28 +316,19 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
 
-        # 寫入儲存格輔助函式 (為 0 或 None 則不填)
-        def write_if_valid(col_key, val):
-            nonlocal total_written
-            if val is not None and val != 0 and val != "0" and val != "":
-                c_idx = col_map.get(col_key)
-                if c_idx:
-                    target_sheet.cell(row=target_row, column=c_idx, value=val)
-                    total_written += 1
-
-        # 依需求填入各儲存格
-        write_if_valid("passenger", to_clean_num(data.passenger_revenue))
-        write_if_valid("freight", to_clean_num(data.freight_revenue))
+        # 寫入儲存格
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
         
         # 信用卡與條碼相減公式
         cc_formula = build_subtraction_value_or_formula(data.credit_card_pos, data.credit_card_neg)
-        write_if_valid("credit", cc_formula)
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
 
         bc_formula = build_subtraction_value_or_formula(data.barcode_in, data.barcode_refund)
-        write_if_valid("barcode", bc_formula)
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
 
-        write_if_valid("other", to_clean_num(data.other_amount))
-        write_if_valid("remittance", to_clean_num(data.remittance_total))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total))
 
         success_count += 1
 
@@ -358,7 +351,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     if audit_records:
         df_audit = pd.DataFrame(audit_records)
         
-        # 計算不平衡單據數
         unbalanced_count = sum(1 for r in audit_records if "❌" in r["平衡狀態"])
         if unbalanced_count > 0:
             st.error(f"⚠️ 警告：共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請依下方表格核對單據金額是否有誤！")
