@@ -29,6 +29,13 @@ with st.sidebar:
     )
     active_api_key = user_key.strip()
     
+    selected_model = st.selectbox(
+        "AI 辨識核心模型",
+        options=["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+        index=0,
+        help="推薦使用 gemini-1.5-flash，速度最快且相容性最高"
+    )
+
     if active_api_key:
         st.success("✅ API 金鑰已就緒")
     else:
@@ -261,6 +268,10 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     3. 特別注意：若有信用卡刷卡(-)或條碼支付退款，切勿重複計入「其他項目」！
     """
 
+    # 優先嘗試選擇的模型，若遇問題則自動備援切換
+    fallback_models = [selected_model, "gemini-1.5-flash", "gemini-2.0-flash"]
+    models_to_try = list(dict.fromkeys(fallback_models))
+
     results_data = []
     audit_records = []
     progress_bar = st.progress(0)
@@ -271,7 +282,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         parsed_data = None
         err_msg = ""
         
-        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        for model_name in models_to_try:
             try:
                 res = client.models.generate_content(
                     model=model_name,
@@ -292,14 +303,14 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             except Exception as e:
                 err_msg = str(e)
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    time.sleep(5.0)
+                    time.sleep(4.0)
                 continue
 
         if parsed_data and parsed_data.date_day > 0:
             results_data.append((file_name, p_idx, parsed_data))
             status_box.write(f"✅ [{idx:02d}/{total_tasks:02d}] **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功")
         else:
-            status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:60]}...)")
+            status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:80]}...)")
         
         time.sleep(1.0)
 
@@ -398,5 +409,5 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
-    )
-    
+        )
+                
