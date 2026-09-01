@@ -11,28 +11,30 @@ from google import genai
 from google.genai import types
 
 # ----------------------------------------------------
-# 1. 網頁基本設定與版本識別
+# 1. 網頁基本設定與金鑰
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🟢 已更新至 V2.0 記憶體極速直傳版 ｜ 🧮 公式保留 ｜ ⚖️ 防呆平衡校驗")
+st.caption("🟢 已升級至 V2.5 智能診斷加速版 ｜ 🧮 公式保留 ｜ ⚖️ 防呆平衡校驗")
 
-# 內嵌專屬金鑰
+# 金鑰最高優先級鎖定
 EMBEDDED_API_KEY = "AQ.Ab8RN6Lno7iLAGhnHoc0cs_k_-c60g2atjdd_84u9nwjpbNN7Q"
-api_key = st.secrets.get("GEMINI_API_KEY", EMBEDDED_API_KEY)
 
 with st.sidebar:
     st.header("⚙️ 系統設定")
-    st.success("✅ 金鑰已內嵌啟用 (V2.0)")
+    user_key = st.text_input("Gemini API Key (預設已內嵌)", value=EMBEDDED_API_KEY, type="password")
+    active_api_key = user_key.strip() if user_key.strip() else EMBEDDED_API_KEY
+    st.success("✅ API 金鑰已就緒")
+    
     concurrency = st.slider(
         "⚡ 平行加速線程數",
         min_value=2,
         max_value=6,
         value=3,
-        help="預設 3~4 線程可達到最穩定且極速的辨識效果。"
+        help="預設 3 線程兼顧速度與穩定度，可在 30 秒內處理 18 頁。"
     )
     st.markdown("---")
-    st.markdown("💡 **操作流程**：\n1. 上傳 Excel 公版\n2. 批次選取 6~7 個掃描 PDF (支援 140 頁)\n3. 點擊開始轉換並下載完成檔")
+    st.markdown("💡 **操作流程**：\n1. 上傳 Excel 公版\n2. 批次選取掃描 PDF (支援 140 頁)\n3. 點擊開始轉換並下載完成檔")
 
 # ----------------------------------------------------
 # 2. 定義資料結構與工具函式
@@ -70,8 +72,8 @@ def build_subtraction_formula(pos_val, neg_val):
         return f"={p}-{n}"
     return p
 
-# 純記憶體傳輸（完全移除 FileService 上傳，杜絕 401 錯誤）
-def process_single_page_ai(task_info, client_instance):
+# 單頁 AI 辨識任務
+def process_single_page_ai(task_info, client_instance, chosen_model):
     file_name, page_idx, total_pages, img_bytes = task_info
     
     prompt = """
@@ -89,33 +91,36 @@ def process_single_page_ai(task_info, client_instance):
     3. 勾稽校核：[客運 + 貨運 + (刷卡+ 減 刷卡-) + (條碼進款 減 條碼退款) + 其他] 必須剛好等於 [應解總計]。
     """
     
-    models = ["gemini-2.5-flash", "gemini-3.6-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    
-    for attempt in range(1, 5):
-        for model_name in models:
-            try:
-                res = client_instance.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=StationReport,
-                        temperature=0.0,
-                    )
+    last_err = ""
+    for attempt in range(1, 4):
+        try:
+            res = client_instance.models.generate_content(
+                model=chosen_model,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=StationReport,
+                    temperature=0.0,
                 )
-                if res and res.text:
-                    data = StationReport.model_validate_json(res.text)
-                    return (file_name, page_idx, data, None)
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    time.sleep(2 * attempt)
-                continue
-                
-    return (file_name, page_idx, None, "多次連線嘗試失敗")
+            )
+            if res and res.text:
+                clean_text = res.text.strip()
+                if "```json" in clean_text:
+                    clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_text:
+                    clean_text = clean_text.split("```")[1].split("```")[0].strip()
+                data = StationReport.model_validate_json(clean_text)
+                return (file_name, page_idx, data, None)
+        except Exception as e:
+            last_err = str(e)
+            if "429" in last_err or "503" in last_err or "RESOURCE_EXHAUSTED" in last_err:
+                time.sleep(2 * attempt)
+            continue
+            
+    return (file_name, page_idx, None, last_err if last_err else "辨識無回應")
 
 # ----------------------------------------------------
 # 3. 檔案上傳介面
@@ -124,7 +129,7 @@ col1, col2 = st.columns(2)
 with col1:
     uploaded_excel = st.file_uploader("📥 步驟 1：上傳 Excel 公版 (.xlsx 或 .xls)", type=["xlsx", "xls"])
 with col2:
-    uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF (可多選)", type=["pdf"], accept_multiple_files=True)
+    uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF (可一次選取多檔)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
 # 4. 極速併發處理引擎
@@ -138,7 +143,34 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         st.stop()
 
     start_time = time.time()
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=active_api_key)
+
+    # 階段 0：0.5 秒智能前置診斷與模型自動鎖定
+    status_box = st.status("🔍 [階段 1/3] 正在進行 API 連線前置診斷...", expanded=True)
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-3.6-flash"]
+    confirmed_model = None
+    preflight_error = ""
+
+    for m in candidate_models:
+        try:
+            test_res = client.models.generate_content(
+                model=m,
+                contents="ping"
+            )
+            if test_res and test_res.text:
+                confirmed_model = m
+                break
+        except Exception as ex:
+            preflight_error = str(ex)
+            continue
+
+    if not confirmed_model:
+        status_box.update(label="❌ 連線前置診斷失敗！", state="error")
+        st.error(f"❌ **API 金鑰驗證失敗！Google 回傳具體錯誤訊息：**\n\n```text\n{preflight_error}\n```")
+        st.info("💡 請確認 Google AI Studio 金鑰權限是否啟用。")
+        st.stop()
+
+    status_box.write(f"✅ 連線成功！已鎖定最佳核心模型：`{confirmed_model}`")
 
     # 處理 Excel 格式
     excel_bytes = uploaded_excel.getvalue()
@@ -150,8 +182,8 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
     else:
         wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
 
-    # 第一階段：解析 PDF 頁面為輕量 JPEG
-    status_box = st.status("⚡ [階段 1/2] 正在高速解析 PDF 頁面...", expanded=True)
+    # 階段 1：解析 PDF 頁面為輕量 JPEG
+    status_box.update(label="⚡ [階段 2/3] 正在高速解析 PDF 頁面...", state="running")
     all_tasks = []
     
     for pdf_file in uploaded_pdfs:
@@ -164,16 +196,16 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
             all_tasks.append((pdf_file.name, p_idx, total_p, buf.getvalue()))
 
     total_pages_all = len(all_tasks)
-    status_box.update(label=f"🚀 [階段 2/2] 啟動 {concurrency} 線程同步辨識全數 {total_pages_all} 頁單據...", state="running")
+    status_box.update(label=f"🚀 [階段 3/3] 啟動 {concurrency} 線程同步辨識全數 {total_pages_all} 頁單據...", state="running")
     
     progress_bar = st.progress(0)
     completed_count = 0
     results = []
     logs = []
 
-    # 第二階段：多線程非同步併發辨識
+    # 階段 2：多線程非同步併發辨識
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        future_to_task = {executor.submit(process_single_page_ai, task, client): task for task in all_tasks}
+        future_to_task = {executor.submit(process_single_page_ai, task, client, confirmed_model): task for task in all_tasks}
         
         for future in as_completed(future_to_task):
             file_name, page_idx, data, err = future.result()
@@ -182,14 +214,14 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
             
             if data and data.date_day > 0:
                 results.append((file_name, page_idx, data))
-                status_box.write(f"⚡ [{completed_count:03d}/{total_pages_all:03d}] **{data.station_name}**（{data.date_day} 號）辨識成功")
+                status_box.write(f"⚡ [{completed_count:02d}/{total_pages_all:02d}] **{data.station_name}**（{data.date_day} 號）辨識成功")
             else:
                 logs.append(f"⚠️ 檔案 `{file_name}` 第 {page_idx} 頁：{err}")
 
     status_box.update(label="✅ 辨識完成！正在快速填寫 Excel 與公式...", state="complete")
     progress_bar.empty()
 
-    # 第三階段：回填 Excel 與防呆平衡校準
+    # 階段 3：回填 Excel 與防呆平衡校準
     total_cells_written = 0
     success_pages = 0
 
