@@ -11,41 +11,33 @@ from google import genai
 from google.genai import types
 
 # ----------------------------------------------------
-# 1. 網頁基本設定與金鑰讀取 (支援 AQ. 最新金鑰)
+# 1. 網頁基本設定與金鑰
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🟢 已適配 Google AQ. 最新金鑰架構 ｜ 🧮 公式保留 ｜ ⚖️ 防呆平衡校驗")
+st.caption("🟢 V3.5 高配額穩定版 ｜ 支援 1,500 次/天標準模型 ｜ 🧮 公式保留 ｜ ⚖️ 會計平衡")
 
 # 自動從 Streamlit Secrets 讀取金鑰
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
-# 若含有引號或前後空白，自動淨化
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
 
 with st.sidebar:
     st.header("⚙️ 系統設定")
     user_key = st.text_input(
-        "Gemini API Key (AQ. 格式)",
+        "Gemini API Key",
         value=cleaned_key,
         type="password",
-        help="支援 Google AI Studio 最新發行的 AQ. 開頭金鑰"
+        help="支援 Google AI Studio 發行之標準金鑰"
     )
     active_api_key = user_key.strip()
     
     if active_api_key:
-        st.success("✅ AQ. 金鑰已就緒")
+        st.success("✅ API 金鑰已就緒")
     else:
-        st.warning("⚠️ 尚未偵測到金鑰，請於上方輸入或在 Secrets 中設定。")
+        st.warning("⚠️ 請在上方輸入金鑰或於 Secrets 中設定。")
 
-    concurrency = st.slider(
-        "⚡ 平行加速線程數",
-        min_value=2,
-        max_value=6,
-        value=3,
-        help="預設 3 線程可穩定且極速地處理大量單據。"
-    )
     st.markdown("---")
-    st.markdown("💡 **操作流程**：\n1. 上傳 Excel 公版\n2. 批次選取掃描 PDF (支援 140 頁)\n3. 點擊開始轉換並下載完成檔")
+    st.markdown("💡 **操作流程**：\n1. 上傳 Excel 公版\n2. 批次選取多個掃描 PDF\n3. 點擊開始轉換並下載完成檔")
 
 # ----------------------------------------------------
 # 2. 定義資料結構與工具函式
@@ -83,8 +75,8 @@ def build_subtraction_formula(pos_val, neg_val):
         return f"={p}-{n}"
     return p
 
-# 單頁 AI 辨識任務
-def process_single_page_ai(task_info, client_instance, chosen_model):
+# 單頁 AI 辨識任務（自動跨模型備援，避開單一模型限額）
+def process_single_page_ai(task_info, client_instance):
     file_name, page_idx, total_pages, img_bytes = task_info
     
     prompt = """
@@ -102,35 +94,39 @@ def process_single_page_ai(task_info, client_instance, chosen_model):
     3. 勾稽校核：[客運 + 貨運 + (刷卡+ 減 刷卡-) + (條碼進款 減 條碼退款) + 其他] 必須剛好等於 [應解總計]。
     """
     
+    # 僅使用高配額（1500 RPD）標準模型，徹底排除 20 次限額模型
+    safe_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     last_err = ""
+    
     for attempt in range(1, 4):
-        try:
-            res = client_instance.models.generate_content(
-                model=chosen_model,
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=StationReport,
-                    temperature=0.0,
+        for model_name in safe_models:
+            try:
+                res = client_instance.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                        prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=StationReport,
+                        temperature=0.0,
+                    )
                 )
-            )
-            if res and res.text:
-                clean_text = res.text.strip()
-                if "```json" in clean_text:
-                    clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-                elif "```" in clean_text:
-                    clean_text = clean_text.split("```")[1].split("```")[0].strip()
-                data = StationReport.model_validate_json(clean_text)
-                return (file_name, page_idx, data, None)
-        except Exception as e:
-            last_err = str(e)
-            if "429" in last_err or "503" in last_err or "RESOURCE_EXHAUSTED" in last_err:
-                time.sleep(2 * attempt)
-            continue
-            
+                if res and res.text:
+                    clean_text = res.text.strip()
+                    if "```json" in clean_text:
+                        clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_text:
+                        clean_text = clean_text.split("```")[1].split("```")[0].strip()
+                    data = StationReport.model_validate_json(clean_text)
+                    return (file_name, page_idx, data, None)
+            except Exception as e:
+                last_err = str(e)
+                if "429" in last_err or "503" in last_err or "RESOURCE_EXHAUSTED" in last_err:
+                    time.sleep(3.0 * attempt)
+                continue
+                
     return (file_name, page_idx, None, last_err if last_err else "辨識無回應")
 
 # ----------------------------------------------------
@@ -159,33 +155,6 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
     start_time = time.time()
     client = genai.Client(api_key=active_api_key)
 
-    # 階段 0：0.5 秒智能前置連線診斷（鎖定 AQ. 支援之最新模型）
-    status_box = st.status("🔍 [階段 1/3] 正在進行 API 連線診斷...", expanded=True)
-    candidate_models = ["gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
-    confirmed_model = None
-    preflight_error = ""
-
-    for m in candidate_models:
-        try:
-            test_res = client.models.generate_content(
-                model=m,
-                contents="ping"
-            )
-            if test_res and test_res.text:
-                confirmed_model = m
-                break
-        except Exception as ex:
-            preflight_error = str(ex)
-            continue
-
-    if not confirmed_model:
-        status_box.update(label="❌ 連線診斷失敗！", state="error")
-        st.error(f"❌ **API 金鑰驗證失敗！Google 回傳訊息：**\n\n```text\n{preflight_error}\n```")
-        st.info("💡 請確認 Google AI Studio 金鑰是否已被啟用。")
-        st.stop()
-
-    status_box.write(f"✅ 連線成功！已成功對接核心模型：`{confirmed_model}`")
-
     # 處理 Excel 格式
     excel_bytes = uploaded_excel.getvalue()
     if uploaded_excel.name.lower().endswith(".xls"):
@@ -196,8 +165,8 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
     else:
         wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
 
-    # 階段 1：解析 PDF 頁面為輕量 JPEG
-    status_box.update(label="⚡ [階段 2/3] 正在高速解析 PDF 頁面...", state="running")
+    # 階段 1：解析 PDF 頁面
+    status_box = st.status("⚡ [階段 1/2] 正在高速解析 PDF 頁面...", expanded=True)
     all_tasks = []
     
     for pdf_file in uploaded_pdfs:
@@ -210,16 +179,16 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
             all_tasks.append((pdf_file.name, p_idx, total_p, buf.getvalue()))
 
     total_pages_all = len(all_tasks)
-    status_box.update(label=f"🚀 [階段 3/3] 啟動 {concurrency} 線程同步辨識全數 {total_pages_all} 頁單據...", state="running")
+    status_box.update(label=f"🚀 [階段 2/2] 啟動平行辨識全數 {total_pages_all} 頁單據...", state="running")
     
     progress_bar = st.progress(0)
     completed_count = 0
     results = []
     logs = []
 
-    # 階段 2：多線程非同步併發辨識
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        future_to_task = {executor.submit(process_single_page_ai, task, client, confirmed_model): task for task in all_tasks}
+    # 階段 2：智慧平滑線程併發 (2 線程兼顧速率與配額安全)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_task = {executor.submit(process_single_page_ai, task, client): task for task in all_tasks}
         
         for future in as_completed(future_to_task):
             file_name, page_idx, data, err = future.result()
