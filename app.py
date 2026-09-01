@@ -61,6 +61,20 @@ class StationReport(BaseModel):
     other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細金額加總，無則為 0")
     remittance_total: float = Field(default=0.0, description="左側【應解款數】區塊內的『應解總計』金額")
 
+def extract_json_str(text: str) -> str:
+    """安全解析模型回傳的 JSON 字串，去除 Markdown 標籤"""
+    if not text:
+        return "{}"
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
 def clean_station_name(val):
     """標準化車站名稱以利比對"""
     if not val:
@@ -180,7 +194,7 @@ def write_cell_if_valid(sheet, row_idx, col_idx, val):
 # ----------------------------------------------------
 # 3. 檔案上傳介面
 # ----------------------------------------------------
-col1, col2 = col_map_display = st.columns(2)
+col1, col2 = st.columns(2)
 with col1:
     uploaded_excel = st.file_uploader("📥 步驟 1：上傳 Excel 公版檔案 (.xlsx 或 .xls)", type=["xlsx", "xls"])
 with col2:
@@ -273,9 +287,125 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
                     )
                 )
                 if res and res.text:
-                    clean_text = res.text.strip()
-                    if "```json" in clean_text:
-                        clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-                    elif "```" in clean_text:
-                        clean_text = clean_text.split("
-                                                      
+                    clean_text = extract_json_str(res.text)
+                    parsed_data = StationReport.model_validate_json(clean_text)
+                    break
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    time.sleep(5.0)
+                continue
+
+        if parsed_data and parsed_data.date_day > 0:
+            results_data.append((file_name, p_idx, parsed_data))
+            status_box.write(f"✅ [{idx:02d}/{total_tasks:02d}] **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功")
+        else:
+            status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:60]}...)")
+        
+        time.sleep(1.0)
+
+    # ----------------------------------------------------
+    # 5. 回填 Excel 與 平衡檢查
+    # ----------------------------------------------------
+    total_written = 0
+    success_count = 0
+
+    for file_name, p_idx, data in results_data:
+        target_name_clean = clean_station_name(data.station_name)
+        
+        # 尋找名稱符合的工作表
+        target_sheet = None
+        for s_name in wb.sheetnames:
+            s_clean = clean_station_name(s_name)
+            if s_clean == target_name_clean or s_clean in target_name_clean or target_name_clean in s_clean:
+                target_sheet = wb[s_name]
+                break
+
+        # 計算勾稽數值
+        net_credit = data.credit_card_pos - data.credit_card_neg
+        net_barcode = data.barcode_in - data.barcode_refund
+        computed_total = data.passenger_revenue + data.freight_revenue + net_credit + net_barcode + data.other_amount
+        diff = round(data.remittance_total - computed_total, 2)
+        is_balanced = (abs(diff) < 0.01)
+
+        # 記錄到查核清單
+        audit_records.append({
+            "檔案名稱": file_name,
+            "車站名稱": data.station_name,
+            "日期": f"{data.date_day} 日",
+            "客運": to_clean_num(data.passenger_revenue),
+            "貨運": to_clean_num(data.freight_revenue),
+            "信用卡刷卡": f"{to_clean_num(data.credit_card_pos)} - {to_clean_num(data.credit_card_neg)}" if data.credit_card_neg > 0 else to_clean_num(data.credit_card_pos),
+            "條碼支付": f"{to_clean_num(data.barcode_in)} - {to_clean_num(data.barcode_refund)}" if data.barcode_refund > 0 else to_clean_num(data.barcode_in),
+            "其他": to_clean_num(data.other_amount),
+            "自輸 (PDF應解總計)": to_clean_num(data.remittance_total),
+            "計算總計": to_clean_num(computed_total),
+            "差額 (自輸-總計)": diff,
+            "平衡狀態": "✅ 平衡 (0)" if is_balanced else f"❌ 差額 {diff:+.0f} (請核對)",
+            "工作表寫入": f"已寫入 [{target_sheet.title}]" if target_sheet else "❌ 找不到分頁"
+        })
+
+        if not target_sheet:
+            continue
+
+        # 解析該工作表結構與定位
+        col_map = analyze_sheet_structure(target_sheet)
+        target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
+
+        # 寫入儲存格
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
+        
+        # 信用卡與條碼相減公式
+        cc_formula = build_subtraction_value_or_formula(data.credit_card_pos, data.credit_card_neg)
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
+
+        bc_formula = build_subtraction_value_or_formula(data.barcode_in, data.barcode_refund)
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
+
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total))
+
+        success_count += 1
+
+    status_box.update(label="🎉 辨識與 Excel 寫入完成！", state="complete")
+    progress_bar.empty()
+
+    # 輸出下載 (一律匯出為標準 .xlsx)
+    out_stream = io.BytesIO()
+    wb.save(out_stream)
+    out_stream.seek(0)
+    elapsed = time.time() - start_time
+
+    st.balloons()
+    st.success(f"✨ 處理完成！耗時 {elapsed:.1f} 秒，共成功處理 {success_count}/{total_tasks} 頁單據，填寫了 {total_written} 個儲存格！")
+
+    # ----------------------------------------------------
+    # 6. 會計平衡檢核儀表板 (自輸 - 總計 = 0 檢查)
+    # ----------------------------------------------------
+    st.subheader("⚖️ 單據會計平衡勾稽核對表")
+    if audit_records:
+        df_audit = pd.DataFrame(audit_records)
+        
+        unbalanced_count = sum(1 for r in audit_records if "❌" in r["平衡狀態"])
+        if unbalanced_count > 0:
+            st.error(f"⚠️ 警告：共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請依下方表格核對單據金額是否有誤！")
+        else:
+            st.success("🎯 太棒了！所有辨識成功的單據「自輸 - 總計」皆等於 0，會計平衡完全正確！")
+
+        st.dataframe(
+            df_audit,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # 下載按鈕
+    st.download_button(
+        label="📥 點擊下載已自動填寫完成的 Excel 報表 (.xlsx)",
+        data=out_stream,
+        file_name="台鐵解款單_彙總完成表.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True
+    )
+    
