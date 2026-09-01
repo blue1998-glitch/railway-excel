@@ -1,6 +1,6 @@
 streamlit
-google-genai
 openpyxl
+pypdf
+pandas
 pydantic
-pdf2image
-pillow
+google-genai
