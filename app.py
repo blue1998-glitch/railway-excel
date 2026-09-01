@@ -17,7 +17,7 @@ st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon=
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
 st.caption("🟢 V3.0 雙模驗證極速版 ｜ 支援 AQ. 金鑰 ｜ 🧮 公式保留 ｜ ⚖️ 防呆平衡校驗")
 
-EMBEDDED_API_KEY = "AQ.Ab8RN6Lno7iLAGhnHoc0cs_k_-c60g2atjdd_84u9nwjpbNN7Q"
+EMBEDDED_API_KEY = ""
 
 with st.sidebar:
     st.header("⚙️ 系統設定")
