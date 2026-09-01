@@ -6,7 +6,6 @@ import pandas as pd
 from pydantic import BaseModel, Field
 from pypdf import PdfReader, PdfWriter
 import streamlit as st
-import xlrd
 from google import genai
 from google.genai import types
 
@@ -17,7 +16,6 @@ st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon=
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
 st.caption("🚀 支援 .xls/.xlsx 雙格式 ｜ 智慧欄位定位 ｜ 🧮 自動相減公式 ｜ ⚖️ 自輸總計平衡檢查")
 
-# 自動從 secrets 讀取金鑰
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
 
@@ -90,11 +88,16 @@ def to_clean_num(val):
         return 0
 
 def load_excel_workbook(file_bytes, filename):
-    """純 Python 支援 .xlsx 與舊版 .xls 格式轉換為 openpyxl 活頁簿"""
+    """支援 .xlsx 與舊版 .xls 格式轉換為 openpyxl 活頁簿"""
     if filename.lower().endswith(".xls"):
+        try:
+            import xlrd
+        except ImportError:
+            raise ImportError("系統尚未安裝 xlrd 套件，請在 requirements.txt 中加入 xlrd。")
+
         xls_book = xlrd.open_workbook(file_contents=file_bytes)
         wb = openpyxl.Workbook()
-        wb.remove(wb.active)  # 移除預設空白頁
+        wb.remove(wb.active)
         
         for sheet_name in xls_book.sheet_names():
             xls_sheet = xls_book.sheet_by_name(sheet_name)
@@ -155,15 +158,14 @@ def analyze_sheet_structure(sheet):
             elif ("日" in val or "期" in val or "號" in val) and "date" not in col_map:
                 col_map["date"] = c
 
-    # 預設公版欄位保底機制
     defaults = {
-        "date": 1,        # 第 A 欄：日期
-        "passenger": 2,   # 第 B 欄：客運
-        "freight": 3,     # 第 C 欄：貨運
-        "credit": 4,      # 第 D 欄：電腦信用卡
-        "barcode": 5,     # 第 E 欄：條碼
-        "other": 6,       # 第 F 欄：其他
-        "remittance": 7   # 第 G 欄：自輸
+        "date": 1,
+        "passenger": 2,
+        "freight": 3,
+        "credit": 4,
+        "barcode": 5,
+        "other": 6,
+        "remittance": 7
     }
     for k, v in defaults.items():
         if k not in col_map:
@@ -214,14 +216,12 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     start_time = time.time()
     client = genai.Client(api_key=active_api_key)
 
-    # 載入 Excel 活頁簿（支援 .xls 與 .xlsx）
     try:
         wb = load_excel_workbook(uploaded_excel.getvalue(), uploaded_excel.name)
     except Exception as e:
-        st.error(f"❌ Excel 讀取失敗，請確認檔案格式是否正確：{e}")
+        st.error(f"❌ Excel 讀取失敗：{e}")
         st.stop()
 
-    # 階段 1：使用 pypdf 拆解 PDF 單頁
     status_box = st.status("📄 [階段 1/2] 正在讀取與拆分 PDF 頁面...", expanded=True)
     all_pages = []
     
@@ -271,7 +271,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         parsed_data = None
         err_msg = ""
         
-        # 嘗試模型辨識
         for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
             try:
                 res = client.models.generate_content(
@@ -313,7 +312,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     for file_name, p_idx, data in results_data:
         target_name_clean = clean_station_name(data.station_name)
         
-        # 尋找名稱符合的工作表
         target_sheet = None
         for s_name in wb.sheetnames:
             s_clean = clean_station_name(s_name)
@@ -321,14 +319,12 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
                 target_sheet = wb[s_name]
                 break
 
-        # 計算勾稽數值
         net_credit = data.credit_card_pos - data.credit_card_neg
         net_barcode = data.barcode_in - data.barcode_refund
         computed_total = data.passenger_revenue + data.freight_revenue + net_credit + net_barcode + data.other_amount
         diff = round(data.remittance_total - computed_total, 2)
         is_balanced = (abs(diff) < 0.01)
 
-        # 記錄到查核清單
         audit_records.append({
             "檔案名稱": file_name,
             "車站名稱": data.station_name,
@@ -348,15 +344,12 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         if not target_sheet:
             continue
 
-        # 解析該工作表結構與定位
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
 
-        # 寫入儲存格
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
         
-        # 信用卡與條碼相減公式
         cc_formula = build_subtraction_value_or_formula(data.credit_card_pos, data.credit_card_neg)
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
 
@@ -371,7 +364,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     status_box.update(label="🎉 辨識與 Excel 寫入完成！", state="complete")
     progress_bar.empty()
 
-    # 輸出下載 (一律匯出為標準 .xlsx)
     out_stream = io.BytesIO()
     wb.save(out_stream)
     out_stream.seek(0)
@@ -399,7 +391,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             hide_index=True
         )
 
-    # 下載按鈕
     st.download_button(
         label="📥 點擊下載已自動填寫完成的 Excel 報表 (.xlsx)",
         data=out_stream,
