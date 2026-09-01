@@ -14,7 +14,7 @@ from google.genai import types
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🚀 支援 .xls/.xlsx 雙格式 ｜ 智慧欄位定位 ｜ 🧮 自動相減公式 ｜ ⚖️ 自輸總計平衡檢查")
+st.caption("🚀 支援 .xls/.xlsx ｜ 🔍 自動探測可用模型 ｜ 🧮 自動相減公式 ｜ ⚖️ 自輸總計平衡檢查")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
@@ -25,19 +25,41 @@ with st.sidebar:
         "Gemini API Key",
         value=cleaned_key,
         type="password",
-        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY，亦可在此手動輸入"
+        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
     )
     active_api_key = user_key.strip()
     
+    # 動態取得此金鑰可用的模型清單
+    available_models = []
+    if active_api_key:
+        try:
+            temp_client = genai.Client(api_key=active_api_key)
+            for m in temp_client.models.list():
+                m_name = getattr(m, "name", "").replace("models/", "")
+                if "gemini" in m_name.lower():
+                    available_models.append(m_name)
+        except Exception:
+            pass
+
+    # 若自動查詢失敗的保底清單
+    if not available_models:
+        available_models = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-2.0-flash-exp"
+        ]
+
     selected_model = st.selectbox(
         "AI 辨識核心模型",
-        options=["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+        options=available_models,
         index=0,
-        help="推薦使用 gemini-1.5-flash，速度最快且相容性最高"
+        help="系統已自動連線篩選出您金鑰目前支援的模型"
     )
 
     if active_api_key:
-        st.success("✅ API 金鑰已就緒")
+        st.success("✅ API 金鑰連線正常")
     else:
         st.warning("⚠️ 請確認已在 secrets 設定或在此輸入 API Key")
 
@@ -125,13 +147,7 @@ def load_excel_workbook(file_bytes, filename):
         return openpyxl.load_workbook(io.BytesIO(file_bytes))
 
 def build_subtraction_value_or_formula(pos_val, neg_val):
-    """
-    建構自動相減公式：
-    - 若兩者皆為 0 ➜ 返回 None（不填入）
-    - 若有正有負 ➜ 生成 Excel 公式 =正數-負數
-    - 若僅有正數 ➜ 填入正數數值
-    - 若僅有負數 ➜ 生成 Excel 公式 =-負數
-    """
+    """建構自動相減公式"""
     p = to_clean_num(pos_val)
     n = to_clean_num(neg_val)
     if p == 0 and n == 0:
@@ -193,7 +209,7 @@ def find_target_row(sheet, date_day, date_col=1):
     return int(date_day) + 1
 
 def write_cell_if_valid(sheet, row_idx, col_idx, val):
-    """寫入儲存格函式：數值為 0 或空值時不填入，成功寫入回傳 1，否則回傳 0"""
+    """寫入儲存格函式：數值為 0 或空值時不填入"""
     if val is not None and val != 0 and val != "0" and val != "":
         if col_idx:
             sheet.cell(row=row_idx, column=col_idx, value=val)
@@ -268,9 +284,8 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     3. 特別注意：若有信用卡刷卡(-)或條碼支付退款，切勿重複計入「其他項目」！
     """
 
-    # 優先嘗試選擇的模型，若遇問題則自動備援切換
-    fallback_models = [selected_model, "gemini-1.5-flash", "gemini-2.0-flash"]
-    models_to_try = list(dict.fromkeys(fallback_models))
+    # 組合嘗試順序：使用者選擇的模型優先，接著自動嘗試可用的其他備援模型
+    models_to_try = [selected_model] + [m for m in available_models if m != selected_model]
 
     results_data = []
     audit_records = []
@@ -303,7 +318,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             except Exception as e:
                 err_msg = str(e)
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    time.sleep(4.0)
+                    time.sleep(3.0)
                 continue
 
         if parsed_data and parsed_data.date_day > 0:
@@ -312,7 +327,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         else:
             status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:80]}...)")
         
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     # ----------------------------------------------------
     # 5. 回填 Excel 與 平衡檢查
@@ -409,5 +424,5 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
-        )
-                
+    )
+    
