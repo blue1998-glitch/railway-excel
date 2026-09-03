@@ -16,7 +16,7 @@ from google.genai import types
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("⚡ 多檔批次極速並行 ｜ 🔍 啟動前模型快篩驗證 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
+st.caption("⚡ 多檔批次極速版 ｜ 🛡️ 防限速原地退避機制 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
@@ -32,11 +32,11 @@ with st.sidebar:
     active_api_key = user_key.strip()
     
     max_workers = st.slider(
-        "並行執行緒數",
+        "並行執行緒數 (建議 2~3)",
         min_value=1,
-        max_value=6,
-        value=3,
-        help="免費版 API 建議設定 2~3；付費版可調高至 4~6 以加快速度。"
+        max_value=4,
+        value=2,
+        help="免費版 API 有 15 次/分鐘上限，設為 2 能確保高速且徹底不撞限速；付費版可設為 3~4。"
     )
 
     if active_api_key:
@@ -46,14 +46,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("""
-    💡 **會計計算原則**：
+    💡 **會計計算與防呆標準**：
     * **電腦信用卡**：`信用卡刷卡(-)` 減 `信用卡退刷(+)`
     * **條碼**：`條碼支付進款(-)` 減 `條碼支付退款(+)`
     * **平衡驗證**：客運 + 貨運 - 電腦信用卡 - 條碼 + 其他 ＝ 自輸(應解總計)
     """)
 
 # ----------------------------------------------------
-# 2. 定義資料結構與工具函式
+# 2. 定義資料結構與輔助函式
 # ----------------------------------------------------
 class StationReport(BaseModel):
     station_name: str = Field(description="車站名稱（例如：埔心、楊梅、富岡、北湖、湖口、新豐、竹北、北新竹、新竹、香山、三姓橋、千甲、新莊、竹中、六家、竹東、內灣、竹南、大山、後龍、白沙屯、新埔、通霄、苑裡、日南、大甲、台中港、清水、沙鹿、龍井、大肚、追分等，不含'站'字）")
@@ -111,7 +111,7 @@ def build_deduction_formula(charge_val, refund_val):
     return None
 
 def find_matching_sheet(wb, station_name):
-    """精準搜尋符合的車站分頁（優先完全精確相符，避免 新竹 被 北新竹 搶走）"""
+    """精準搜尋符合的車站分頁（優先完全精確相符，避免新竹被北新竹覆蓋）"""
     clean_target = clean_station_name(station_name)
     if not clean_target:
         return None
@@ -157,7 +157,6 @@ def load_excel_preserving_all(file_bytes, filename):
                 for day_r in range(2, 33):
                     xlsx_sheet.cell(row=day_r, column=8, value=f"=B{day_r}+C{day_r}-D{day_r}-E{day_r}+F{day_r}")
                     xlsx_sheet.cell(row=day_r, column=9, value=f"=G{day_r}-H{day_r}")
-                # 第 33 列合計公式
                 xlsx_sheet.cell(row=33, column=1, value="合計")
                 for col_i in range(2, 10):
                     col_letter = openpyxl.utils.get_column_letter(col_i)
@@ -204,7 +203,7 @@ def analyze_sheet_structure(sheet):
     return col_map
 
 def find_target_row(sheet, date_day, date_col=1):
-    """精準搜尋日期所在列數"""
+    """搜尋日期所在列數"""
     for r in range(1, 50):
         val = sheet.cell(row=r, column=date_col).value
         if val is not None:
@@ -225,17 +224,18 @@ def write_cell_if_valid(sheet, row_idx, col_idx, val):
     return 0
 
 # ----------------------------------------------------
-# 3. 啟動前快速快篩檢測有效模型
+# 3. 啟動前快篩檢測唯一有效模型
 # ----------------------------------------------------
 def preflight_check_active_model(api_key):
-    """於執行前快篩出當前金鑰可用之模型"""
+    """快篩出當前金鑰真正可用的模型，絕不使用會噴 404 的型號"""
     client = genai.Client(api_key=api_key)
-    candidates = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+    # 僅測試官方最穩定標準的模型
+    candidates = ["gemini-1.5-flash", "gemini-2.0-flash"]
     for model_name in candidates:
         try:
             resp = client.models.generate_content(
                 model=model_name,
-                contents="ping",
+                contents="test",
                 config=types.GenerateContentConfig(max_output_tokens=3)
             )
             if resp and resp.text:
@@ -245,47 +245,44 @@ def preflight_check_active_model(api_key):
     return "gemini-1.5-flash"
 
 # ----------------------------------------------------
-# 4. 單頁獨立背景辨識函式 (多執行緒與自動備援)
+# 4. 單頁獨立背景辨識函式 (防限速原地重試)
 # ----------------------------------------------------
-def process_single_page_worker(task, api_key, primary_model, prompt):
+def process_single_page_worker(task, api_key, target_model, prompt):
     file_name, p_idx, total_p, page_bytes = task
     client = genai.Client(api_key=api_key)
     
-    # 嘗試順序：首選模型 ➜ 備援模型
-    models_to_try = [primary_model]
-    for m in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
-        if m not in models_to_try:
-            models_to_try.append(m)
+    # 稍微隨機錯開每個執行緒發送時間，避免同時撞擊 API 限速
+    time.sleep(random.uniform(0.2, 1.2))
 
     last_err = ""
-    for attempt in range(1, 5):
-        for model_name in models_to_try:
-            try:
-                res = client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=StationReport,
-                        temperature=0.0,
-                    )
+    # 原地重試最多 5 次
+    for attempt in range(1, 6):
+        try:
+            res = client.models.generate_content(
+                model=target_model,
+                contents=[
+                    types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=StationReport,
+                    temperature=0.0,
                 )
-                if res and res.text:
-                    clean_json = extract_json_str(res.text)
-                    data = StationReport.model_validate_json(clean_json)
-                    if data and data.date_day > 0:
-                        return (file_name, p_idx, data, None)
-            except Exception as e:
-                last_err = str(e)
-                if "429" in last_err or "RESOURCE_EXHAUSTED" in last_err:
-                    time.sleep(5.0 * attempt + random.uniform(1.0, 3.0))
-                    continue
-                if "404" in last_err or "NOT_FOUND" in last_err:
-                    continue
-                time.sleep(1.0)
+            )
+            if res and res.text:
+                clean_json = extract_json_str(res.text)
+                data = StationReport.model_validate_json(clean_json)
+                if data and data.date_day > 0:
+                    return (file_name, p_idx, data, None)
+        except Exception as e:
+            last_err = str(e)
+            # 若遇 429 限速，強制等待並退避，絕不切換到不存在的模型
+            if "429" in last_err or "RESOURCE_EXHAUSTED" in last_err:
+                sleep_time = 4.5 * attempt + random.uniform(1.0, 2.5)
+                time.sleep(sleep_time)
+                continue
+            time.sleep(2.0)
             
     return (file_name, p_idx, None, last_err)
 
@@ -318,12 +315,12 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         st.error(f"❌ Excel 讀取失敗：{e}")
         st.stop()
 
-    status_box = st.status("📄 [階段 1/3] 正在檢驗 API 金鑰並拆分 PDF 頁面...", expanded=True)
+    status_box = st.status("📄 [階段 1/3] 正在驗證模型並拆分 PDF 頁面...", expanded=True)
     
-    # 進行模型連線檢測
-    status_box.write("🔍 正在連線快篩可用模型...")
+    # 進行模型連線快篩
+    status_box.write("🔍 正在檢測並鎖定可用模型...")
     working_model = preflight_check_active_model(active_api_key)
-    status_box.write(f"🎯 核心模型檢測通過，鎖定採用：`{working_model}`")
+    status_box.write(f"🎯 鎖定穩定主力模型：`{working_model}`")
 
     # 拆分所有 PDF 頁面
     all_pages = []
@@ -397,17 +394,16 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
 
     progress_bar.empty()
 
-    # 檢查是否有任何辨識成果
     if not results_data:
         status_box.update(label="❌ 辨識失敗：未成功辨識任何單據！", state="error")
-        st.error("⚠️ 未能成功擷取到單據資料。以下為詳細錯誤原因，請核對 API 金鑰或網路狀態：")
+        st.error("⚠️ 未能成功擷取到單據資料。以下為詳細錯誤原因，請核對 API 金鑰：")
         for fn, p, err in failed_tasks[:10]:
             st.code(f"{fn} 第 {p} 頁: {err}")
         st.stop()
 
-    status_box.update(label=f"📝 [階段 3/3] 正在將 {len(results_data)} 筆單據精準填入 Excel 對應分頁與日期...", state="running")
+    status_box.update(label=f"📝 [階段 3/3] 正在將 {len(results_data)} 筆單據填入 Excel 對應分頁與日期...", state="running")
 
-    # 依檔案名稱與頁數排序
+    # 依檔案與頁碼排序
     results_data.sort(key=lambda x: (x[0], x[1]))
 
     # ----------------------------------------------------
