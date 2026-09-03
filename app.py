@@ -1,6 +1,7 @@
 import io
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import openpyxl
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -29,30 +30,26 @@ with st.sidebar:
     )
     active_api_key = user_key.strip()
     
-    # 自動探測此 API Key 支援的所有模型
-    available_models = []
+    # 預設高速穩定模型清單，若連線正常則動態補充
+    available_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     if active_api_key:
         try:
             temp_client = genai.Client(api_key=active_api_key)
+            fetched = []
             for m in temp_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
-                if "gemini" in m_name.lower():
-                    available_models.append(m_name)
+                if "gemini" in m_name.lower() and ("flash" in m_name.lower() or "pro" in m_name.lower()):
+                    fetched.append(m_name)
+            if fetched:
+                available_models = sorted(list(set(fetched)), key=lambda x: (0 if "2.0-flash" in x else (1 if "1.5-flash" in x else 2)))
         except Exception:
             pass
-
-    if not available_models:
-        available_models = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
-        ]
 
     selected_model = st.selectbox(
         "AI 辨識核心模型",
         options=available_models,
         index=0,
-        help="系統已自動連線並篩選出您金鑰支援的模型"
+        help="推薦使用 flash 系列模型，速度快且對表格辨識精準"
     )
 
     if active_api_key:
@@ -156,17 +153,13 @@ def load_excel_preserving_all(file_bytes, filename):
                     if val != "" and val is not None:
                         xlsx_sheet.cell(row=r + 1, column=c + 1, value=val)
             
-            # 若為各車站分頁，補建 H欄(總計) 與 I欄(自輸-總計) 公式以確保正確計算
             header_row = [str(xlsx_sheet.cell(1, c).value or "") for c in range(1, 10)]
             if any("客運" in h for h in header_row):
                 for day_r in range(2, 33):
-                    # 總計 = 客運(B) + 貨運(C) - 電腦信用卡(D) - 條碼(E) + 其他(F)
                     xlsx_sheet.cell(row=day_r, column=8, value=f"=B{day_r}+C{day_r}-D{day_r}-E{day_r}+F{day_r}")
-                    # 自輸-總計 = 自輸(G) - 總計(H)
                     xlsx_sheet.cell(row=day_r, column=9, value=f"=G{day_r}-H{day_r}")
         return wb
     else:
-        # .xlsx 原生格式直接完整載入（不觸動原本公式、格式、名稱）
         return openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
 
 def analyze_sheet_structure(sheet):
@@ -192,15 +185,14 @@ def analyze_sheet_structure(sheet):
             elif ("日" in val or "期" in val or "號" in val) and "date" not in col_map:
                 col_map["date"] = c
 
-    # 台鐵公版標準欄位配置保底
     defaults = {
-        "date": 1,        # A欄: 日期
-        "passenger": 2,   # B欄: 客運
-        "freight": 3,     # C欄: 貨運
-        "credit": 4,      # D欄: 電腦信用卡
-        "barcode": 5,     # E欄: 條碼
-        "other": 6,       # F欄: 其他
-        "remittance": 7   # G欄: 自輸
+        "date": 1,
+        "passenger": 2,
+        "freight": 3,
+        "credit": 4,
+        "barcode": 5,
+        "other": 6,
+        "remittance": 7
     }
     for k, v in defaults.items():
         if k not in col_map:
@@ -238,7 +230,7 @@ with col2:
     uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
-# 4. 核心辨識與填寫
+# 4. 核心辨識與填寫（多執行緒並行高速版）
 # ----------------------------------------------------
 if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_container_width=True):
     if not active_api_key:
@@ -279,12 +271,15 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
         st.stop()
 
-    status_box.update(label=f"🚀 [階段 2/2] 正在辨識 {total_tasks} 頁解款單據並填寫 Excel...", state="running")
+    status_box.update(label=f"🚀 [階段 2/2] 正在多工辨識 {total_tasks} 頁解款單據並填寫 Excel...", state="running")
     
+    # 強化提示詞：增加淺色印件識別引導與會計平衡自檢反推
     prompt = """
     你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據：
-    1. 擷取【車站名稱】（例如：埔心、楊梅、富岡、北湖、湖口、新豐、竹北、北新竹、新竹、香山、大甲等）與進款【日期】（僅需日/號數，1-31 的整數）。
-    2. 專注看左側【應解款數】大項目區塊，精確擷取各數值（若無填 0）：
+    【特別注意】：
+    1. 本單據可能為影印本且字跡、複寫痕跡或印泥顏色較淺，請特別仔細分辨淺色或模糊數字（如 0、3、8、1、7），切勿遺漏淺色墨跡。
+    2. 擷取【車站名稱】（例如：埔心、楊梅、富岡、北湖、湖口、新豐、竹北、北新竹、新竹、香山、大甲等，不需包含'站'字）與進款【日期】（僅需日/號數，1-31 的整數）。
+    3. 專注看左側【應解款數】大項目區塊，精確擷取各數值（若無填 0）：
        - 客運(+)
        - 貨運(+)
        - 信用卡刷卡(-) (填正數)
@@ -293,26 +288,20 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
        - 條碼支付退款(+) (填正數)
        - 應解總計 (報表上的應解總計數值)
        - 其他項目加總（若有存付運費、託收支票、補繳金額、自售機短欠等款項，請計算其淨額填入其他；若無則填 0）
+    4. 平衡驗算指引：正常情況下應符合「客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計」。若遇到淺色不確定字跡，請利用此會計勾稽平衡原則反推驗算確認！
     """
 
-    models_to_try = [selected_model] + [m for m in available_models if m != selected_model]
-
-    results_data = []
-    audit_records = []
-    progress_bar = st.progress(0)
-    
-    for idx, (file_name, p_idx, total_p, page_bytes) in enumerate(all_pages, 1):
-        progress_bar.progress(idx / total_tasks, text=f"正在辨識第 {idx}/{total_tasks} 頁...")
-        
-        parsed_data = None
-        err_msg = ""
-        
-        for model_name in models_to_try:
+    # 單頁辨識任務函式（含防抖動重試）
+    def process_single_task(task_args):
+        task_idx, f_name, p_i, tot_p, p_bytes = task_args
+        res_obj = None
+        err = ""
+        for attempt in range(3):
             try:
                 res = client.models.generate_content(
-                    model=model_name,
+                    model=selected_model,
                     contents=[
-                        types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
+                        types.Part.from_bytes(data=p_bytes, mime_type="application/pdf"),
                         prompt
                     ],
                     config=types.GenerateContentConfig(
@@ -323,27 +312,53 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
                 )
                 if res and res.text:
                     clean_text = extract_json_str(res.text)
-                    parsed_data = StationReport.model_validate_json(clean_text)
+                    res_obj = StationReport.model_validate_json(clean_text)
                     break
             except Exception as e:
-                err_msg = str(e)
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    time.sleep(3.0)
-                continue
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    time.sleep(2.5 * (attempt + 1))
+                else:
+                    time.sleep(1.0)
+        return task_idx, f_name, p_i, res_obj, err
 
-        if parsed_data and parsed_data.date_day > 0:
-            results_data.append((file_name, p_idx, parsed_data))
-            status_box.write(f"✅ [{idx:02d}/{total_tasks:02d}] **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功")
-        else:
-            status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁：辨識失敗 ({err_msg[:80]}...)")
+    results_map = {}
+    completed = 0
+    progress_bar = st.progress(0)
+    
+    # 採用 3 條並行通道，兼顧超高速度與避免觸發 API 限制
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        tasks = [
+            (idx, fn, pi, tot, b)
+            for idx, (fn, pi, tot, b) in enumerate(all_pages, 1)
+        ]
+        future_to_task = {executor.submit(process_single_task, t): t[0] for t in tasks}
         
-        time.sleep(0.5)
+        for future in as_completed(future_to_task):
+            t_idx, f_name, p_i, parsed_data, err_msg = future.result()
+            results_map[t_idx] = (f_name, p_i, parsed_data)
+            completed += 1
+            progress_bar.progress(completed / total_tasks, text=f"⚡ 高速辨識中：已完成 {completed}/{total_tasks} 頁...")
+            
+            if parsed_data and parsed_data.date_day > 0:
+                status_box.write(f"✅ [{completed:02d}/{total_tasks:02d}] `{f_name}` 第 {p_i} 頁：**{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功")
+            else:
+                status_box.write(f"⚠️ [{completed:02d}/{total_tasks:02d}] `{f_name}` 第 {p_i} 頁：辨識異常 ({err_msg[:60]}...)")
+
+    # 按原本順序回填資料
+    results_data = []
+    for idx in range(1, total_tasks + 1):
+        if idx in results_map:
+            f_name, p_i, p_data = results_map[idx]
+            if p_data and p_data.date_day > 0:
+                results_data.append((f_name, p_i, p_data))
 
     # ----------------------------------------------------
     # 5. 回填 Excel 與 會計立場平衡檢查
     # ----------------------------------------------------
     total_written = 0
     success_count = 0
+    audit_records = []
 
     for file_name, p_idx, data in results_data:
         target_name_clean = clean_station_name(data.station_name)
@@ -355,11 +370,9 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
                 target_sheet = wb[s_name]
                 break
 
-        # 會計扣抵金額計算：刷卡(-) 減 退刷(+)；條碼進(-) 減 條碼退(+)
         net_credit = data.credit_card_charge - data.credit_card_refund
         net_barcode = data.barcode_in - data.barcode_refund
 
-        # 會計平衡公式：總計 = 客運 + 貨運 - 電腦信用卡 - 條碼 + 其他
         computed_total = data.passenger_revenue + data.freight_revenue - net_credit - net_barcode + data.other_amount
         diff = round(data.remittance_total - computed_total, 2)
         is_balanced = (abs(diff) < 0.01)
@@ -386,15 +399,12 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
 
-        # 寫入儲存格（僅填寫數值或公式，絕不更動原本既有的表頭與格式）
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
         
-        # 信用卡公式：=刷卡-退刷
         cc_formula = build_deduction_formula(data.credit_card_charge, data.credit_card_refund)
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
 
-        # 條碼支付公式：=進款-退款
         bc_formula = build_deduction_formula(data.barcode_in, data.barcode_refund)
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
 
