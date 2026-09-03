@@ -31,18 +31,18 @@ with st.sidebar:
 
     selected_model = st.selectbox(
         "AI 辨識核心模型",
-        options=["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        options=["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
         index=0,
-        help="推薦使用 gemini-2.0-flash，速度快且辨識精準度最高"
+        help="Google AI Studio 請預設使用 gemini-1.5-flash，相容性最高且辨識速度最快"
     )
 
     request_delay = st.slider(
         "⏱️ 每頁辨識間隔 (秒)",
-        min_value=1.0,
-        max_value=4.0,
+        min_value=1.5,
+        max_value=3.5,
         value=2.0,
         step=0.5,
-        help="免費版 API 請保持 2.0 秒以避免觸發 429 頻率限制；若使用付費版 API 可降至 1.0 秒加速"
+        help="免費版 API 請保持 2.0 秒以避免觸發 429 頻率上限"
     )
 
     if active_api_key:
@@ -70,7 +70,7 @@ class StationReport(BaseModel):
     credit_card_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『信用卡退刷(+)』金額 (填正數)，無則為 0")
     barcode_in: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付進款(-)』金額 (填正數)，無則為 0")
     barcode_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付退款(+)』金額 (填正數)，無則為 0")
-    other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細金額加總（如存付運費、託收支票、補繳金額、繳回週轉金、其他短欠等），若無則填 0")
+    other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細金額加總（如存付運費、託收支票、補繳金額、繳回週轉金、其他短欠等款項），若無則填 0")
     remittance_total: float = Field(default=0.0, description="左側【應解款數】區塊內的『應解總計』金額")
 
 def extract_json_str(text: str) -> str:
@@ -211,7 +211,7 @@ with col2:
     uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
-# 4. 核心辨識與填寫
+# 4. 核心辨識與填寫（自動防 404 / 429 穩定高速版）
 # ----------------------------------------------------
 if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_container_width=True):
     if not active_api_key:
@@ -252,7 +252,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
         st.stop()
 
-    status_box.update(label=f"🚀 [階段 2/2] 正在穩定辨識 {total_tasks} 頁單據並寫入 Excel...", state="running")
+    status_box.update(label=f"🚀 [階段 2/2] 正在穩定辨識 {total_tasks} 頁解款單據並填寫 Excel...", state="running")
     
     prompt = """
     你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據：
@@ -271,42 +271,55 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     4. 平衡驗算指引：正常情況下應符合「客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計」。若遇到淺色不確定字跡，請利用此會計勾稽平衡原則反推驗算確認！
     """
 
+    # 候選模型清單（優先使用所選，若遇 404 自動切換至支援模型）
+    candidate_models = [selected_model] + [m for m in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"] if m != selected_model]
+    active_working_model = None
+
     results_data = []
     progress_bar = st.progress(0)
     
-    # 依序單工辨識，附帶智慧 429 退避機制，保證 100% 穩定成功
     for idx, (file_name, p_idx, total_p, page_bytes) in enumerate(all_pages, 1):
-        progress_bar.progress(idx / total_tasks, text=f"正在處理第 {idx}/{total_tasks} 頁（{file_name} 第 {p_idx} 頁）...")
+        progress_bar.progress(idx / total_tasks, text=f"正在辨識第 {idx}/{total_tasks} 頁（`{file_name}` 第 {p_idx} 頁）...")
         
         parsed_data = None
         err_msg = ""
         
-        for attempt in range(4):
-            try:
-                res = client.models.generate_content(
-                    model=selected_model,
-                    contents=[
-                        types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=StationReport,
-                        temperature=0.0,
+        # 若已找到可用模型，後續頁面直接呼叫該模型；否則測試候選模型
+        models_to_call = [active_working_model] if active_working_model else candidate_models
+        
+        for model_name in models_to_call:
+            for attempt in range(3):
+                try:
+                    res = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
+                            prompt
+                        ],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=StationReport,
+                            temperature=0.0,
+                        )
                     )
-                )
-                if res and res.text:
-                    clean_text = extract_json_str(res.text)
-                    parsed_data = StationReport.model_validate_json(clean_text)
-                    break
-            except Exception as e:
-                err_msg = str(e)
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    sleep_sec = 15.0 + attempt * 5.0
-                    status_box.write(f"⏳ 第 {idx} 頁觸發 API 每分鐘頻率保護，等待 {int(sleep_sec)} 秒以釋放配額...")
-                    time.sleep(sleep_sec)
-                else:
-                    time.sleep(2.0)
+                    if res and res.text:
+                        clean_text = extract_json_str(res.text)
+                        parsed_data = StationReport.model_validate_json(clean_text)
+                        active_working_model = model_name  # 成功鎖定有效模型
+                        break
+                except Exception as e:
+                    err_msg = str(e)
+                    if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                        sleep_sec = 12.0 + attempt * 4.0
+                        status_box.write(f"⏳ 第 {idx} 頁觸發頻率限制，休息 {int(sleep_sec)} 秒後自動重試...")
+                        time.sleep(sleep_sec)
+                    elif "404" in err_msg:
+                        # 此模型在目前金鑰無權限或不存在，立即換下一個候選模型，不白費時間重試
+                        break
+                    else:
+                        time.sleep(1.5)
+            if parsed_data:
+                break
 
         if parsed_data and parsed_data.date_day > 0:
             results_data.append((file_name, p_idx, parsed_data))
@@ -327,11 +340,18 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         target_name_clean = clean_station_name(data.station_name)
         
         target_sheet = None
+        # 優先完全符合車站名
         for s_name in wb.sheetnames:
-            s_clean = clean_station_name(s_name)
-            if s_clean == target_name_clean or s_clean in target_name_clean or target_name_clean in s_clean:
+            if clean_station_name(s_name) == target_name_clean:
                 target_sheet = wb[s_name]
                 break
+        # 若無則模糊匹配
+        if not target_sheet:
+            for s_name in wb.sheetnames:
+                s_clean = clean_station_name(s_name)
+                if s_clean and (s_clean in target_name_clean or target_name_clean in s_clean):
+                    target_sheet = wb[s_name]
+                    break
 
         net_credit = data.credit_card_charge - data.credit_card_refund
         net_barcode = data.barcode_in - data.barcode_refund
