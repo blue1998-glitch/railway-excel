@@ -17,7 +17,7 @@ from google.genai import types
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("⚡ 多檔批次極速版 ｜ 🔍 高清原生影像直出 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
+st.caption("⚡ 多檔批次極速版 ｜ 🔍 自動模型權限檢測 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
@@ -28,30 +28,23 @@ with st.sidebar:
         "Gemini API Key",
         value=cleaned_key,
         type="password",
-        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
+        help="請使用以 AIzaSy 開頭的 Google AI Studio 金鑰"
     )
     active_api_key = user_key.strip()
     
-    # 僅提供官方已上線之標準模型
-    selected_model = st.selectbox(
-        "AI 辨識核心模型",
-        options=["gemini-2.0-flash", "gemini-1.5-flash"],
-        index=0,
-        help="推薦 gemini-2.0-flash，辨識速度最快且對表格與淺色字跡判讀力最強"
-    )
-
     max_workers = st.slider(
         "並行執行緒數",
         min_value=1,
         max_value=4,
         value=2,
-        help="建議設為 2，既能大幅加速又能穩定防止 Google 頻率限制 (429)"
+        help="建議設為 2，兼具高速辨識與穩定度，杜絕頻率超限"
     )
 
     if active_api_key:
-        st.success("✅ API 金鑰已就緒")
-    else:
-        st.warning("⚠️ 請確認已在 secrets 設定或在此輸入 API Key")
+        if active_api_key.startswith("AIzaSy"):
+            st.success("✅ 金鑰格式正確 (Google AI Studio)")
+        else:
+            st.warning("⚠️ 提醒：官方標準金鑰通常以 AIzaSy 開頭，若遇到 404 請至 Google AI Studio 免費申請。")
 
     st.markdown("---")
     st.markdown("""
@@ -120,15 +113,13 @@ def build_deduction_formula(charge_val, refund_val):
     return None
 
 def find_matching_sheet(wb, station_name):
-    """精準搜尋符合的車站分頁（優先完全精確相符，避免新竹被北新竹覆蓋）"""
+    """精準搜尋符合的車站分頁（優先完全精確相符）"""
     clean_target = clean_station_name(station_name)
     if not clean_target:
         return None
-    # 步驟 1：完全精確相符
     for s_name in wb.sheetnames:
         if clean_station_name(s_name) == clean_target:
             return wb[s_name]
-    # 步驟 2：模糊包含比對
     candidates = []
     for s_name in wb.sheetnames:
         s_clean = clean_station_name(s_name)
@@ -140,12 +131,11 @@ def find_matching_sheet(wb, station_name):
     return None
 
 def extract_page_image_payload(page):
-    """從 PDF 頁面抽取高解析度 JPEG 原圖（純 Python，免 Poppler）"""
+    """從 PDF 頁面抽取掃描圖檔（純 Python，免 Poppler）"""
     if len(page.images) > 0:
         raw_bytes = page.images[0].data
         try:
             pil_img = Image.open(io.BytesIO(raw_bytes))
-            # 若圖檔尺寸超大，微幅縮小至 1800px 以極速傳輸，同時保持印刷筆劃極致清晰
             if max(pil_img.size) > 1800:
                 ratio = 1800 / max(pil_img.size)
                 new_size = (int(pil_img.size[0] * ratio), int(pil_img.size[1] * ratio))
@@ -157,7 +147,6 @@ def extract_page_image_payload(page):
         except Exception:
             return ("image/jpeg", raw_bytes)
     else:
-        # 若為文字型 PDF 則直接輸出單頁 PDF 串流
         writer = PdfWriter()
         writer.add_page(page)
         buf = io.BytesIO()
@@ -259,17 +248,56 @@ def write_cell_if_valid(sheet, row_idx, col_idx, val):
     return 0
 
 # ----------------------------------------------------
-# 3. 單頁背景獨立辨識函式
+# 3. 測試金鑰並取得真正可用之模型
+# ----------------------------------------------------
+def discover_and_test_model(api_key):
+    """主動探測此金鑰在 Google 端實際有權限呼叫的模型"""
+    client = genai.Client(api_key=api_key)
+    
+    # 依優先順序測試標準模型
+    test_candidates = ["gemini-2.0-flash", "gemini-1.5-flash"]
+    
+    # 先嘗試查詢 ListModels
+    try:
+        remote_models = [
+            getattr(m, "name", "").replace("models/", "")
+            for m in client.models.list()
+            if "gemini" in getattr(m, "name", "").lower()
+        ]
+        if remote_models:
+            # 將遠端支援的模型排在最前面
+            test_candidates = [m for m in test_candidates if m in remote_models] + [m for m in remote_models if m not in test_candidates]
+    except Exception:
+        pass
+
+    for candidate in test_candidates:
+        try:
+            resp = client.models.generate_content(
+                model=candidate,
+                contents="ping",
+                config=types.GenerateContentConfig(max_output_tokens=2)
+            )
+            if resp:
+                return candidate, None
+        except Exception as e:
+            err_str = str(e)
+            if "404" not in err_str:
+                # 若不是 404（例如被頻率限制 429），代表該模型存在且有權限
+                return candidate, None
+            continue
+            
+    return None, "金鑰無法存取任何 Gemini 模型（Google 回傳 404 NOT_FOUND）"
+
+# ----------------------------------------------------
+# 4. 單頁背景獨立辨識函式
 # ----------------------------------------------------
 def process_single_page_worker(task, api_key, model_name, prompt):
     file_name, p_idx, total_p, mime_type, payload_bytes = task
     client = genai.Client(api_key=api_key)
     
-    # 輕微錯開執行緒，避免瞬間觸發 API 限速
     time.sleep(random.uniform(0.3, 1.2))
-
     last_err = ""
-    # 針對同一模型原地重試，遇 429 退避等待
+    
     for attempt in range(1, 6):
         try:
             res = client.models.generate_content(
@@ -292,15 +320,14 @@ def process_single_page_worker(task, api_key, model_name, prompt):
         except Exception as e:
             last_err = str(e)
             if "429" in last_err or "RESOURCE_EXHAUSTED" in last_err:
-                sleep_time = 4.0 * attempt + random.uniform(1.0, 2.0)
-                time.sleep(sleep_time)
+                time.sleep(4.5 * attempt + random.uniform(1.0, 2.0))
                 continue
             time.sleep(1.5)
             
     return (file_name, p_idx, None, last_err)
 
 # ----------------------------------------------------
-# 4. 介面上傳區塊
+# 5. 介面上傳區塊
 # ----------------------------------------------------
 col1, col2 = st.columns(2)
 with col1:
@@ -309,7 +336,7 @@ with col2:
     uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選同時處理)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
-# 5. 核心處理引擎
+# 6. 核心處理引擎
 # ----------------------------------------------------
 if st.button("🚀 開始極速自動辨識與填表", type="primary", use_container_width=True):
     if not active_api_key:
@@ -320,23 +347,24 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         st.stop()
 
     start_time = time.time()
-    client = genai.Client(api_key=active_api_key)
+    status_box = st.status("🔍 [階段 1/3] 正在檢測 API 金鑰授權狀態...", expanded=True)
 
-    # 階段 1：執行前 1 秒連線快篩
-    status_box = st.status("📄 [階段 1/3] 正在驗證模型與拆分 PDF 頁面...", expanded=True)
-    
-    verified_model = selected_model
-    try:
-        test_res = client.models.generate_content(
-            model=selected_model,
-            contents="hello",
-            config=types.GenerateContentConfig(max_output_tokens=2)
-        )
-    except Exception as e:
-        status_box.write(f"⚠️ 模型 `{selected_model}` 回應異常，自動切換至備用主力 `gemini-1.5-flash`...")
-        verified_model = "gemini-1.5-flash"
+    # 實測金鑰權限
+    verified_model, auth_err = discover_and_test_model(active_api_key)
+    if not verified_model:
+        status_box.update(label="❌ API 金鑰未授權 Gemini 服務！", state="error")
+        st.error(f"""
+        ### 🚨 金鑰權限不足（Google 伺服器回傳 404 NOT_FOUND）
+        您目前使用的金鑰沒有開啟 Gemini 模型權限。
+        
+        **請花 30 秒免費更換金鑰（100% 成功）：**
+        1. 前往 👉 **[Google AI Studio (點此免費申請)](https://aistudio.google.com/app/apikey)**
+        2. 登入 Google 帳號後，點擊 **「Create API key」**
+        3. 將產生的金鑰（以 `AIzaSy...` 開頭）貼到左側輸入框後重新點擊開始！
+        """)
+        st.stop()
 
-    status_box.write(f"🎯 核心模型已鎖定：`{verified_model}`")
+    status_box.write(f"✅ 金鑰驗證通過！鎖定有效主力模型：`{verified_model}`")
 
     # 載入 Excel
     try:
@@ -416,18 +444,16 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
 
     if not results_data:
         status_box.update(label="❌ 辨識失敗：未成功辨識任何單據！", state="error")
-        st.error("⚠️ 未能成功擷取到單據資料。以下為詳細錯誤原因，請核對 API 金鑰：")
-        for fn, p, err in failed_tasks[:10]:
+        st.error("⚠️ 未能成功擷取到單據資料。請確認是否已更換為 Google AI Studio 金鑰。")
+        for fn, p, err in failed_tasks[:5]:
             st.code(f"{fn} 第 {p} 頁: {err}")
         st.stop()
 
     status_box.update(label=f"📝 [階段 3/3] 正在將 {len(results_data)} 筆單據填入 Excel 對應分頁與日期...", state="running")
-
-    # 依檔案與頁碼排序
     results_data.sort(key=lambda x: (x[0], x[1]))
 
     # ----------------------------------------------------
-    # 6. 回填 Excel 與 會計立場平衡檢查
+    # 7. 回填 Excel 與 會計立場平衡檢查
     # ----------------------------------------------------
     total_written = 0
     success_count = 0
@@ -492,7 +518,7 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
     st.success(f"✨ 處理完成！耗時 {elapsed:.1f} 秒！共成功處理 {success_count}/{total_tasks} 頁單據，填寫了 {total_written} 個儲存格！")
 
     # ----------------------------------------------------
-    # 7. 會計平衡檢核儀表板
+    # 8. 會計平衡檢核儀表板
     # ----------------------------------------------------
     st.subheader("⚖️ 單據會計平衡勾稽核對表")
     if audit_records:
@@ -512,4 +538,3 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
-    )
