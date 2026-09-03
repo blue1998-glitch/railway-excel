@@ -4,6 +4,7 @@ import time
 import random
 import openpyxl
 import pandas as pd
+from PIL import Image
 from pydantic import BaseModel, Field
 from pypdf import PdfReader, PdfWriter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,79 +17,45 @@ from google.genai import types
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("⚡ 多檔批次極速版 ｜ 🔍 即時模型探測與診斷 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
+st.caption("⚡ 多檔批次極速版 ｜ 🔍 高清原生影像直出 ｜ 🧮 扣抵公式保留 ｜ 🎯 零死角跨日彙總")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
 
 with st.sidebar:
-    st.header("⚙️ 系統與金鑰診斷")
+    st.header("⚙️ 系統效能設定")
     user_key = st.text_input(
         "Gemini API Key",
         value=cleaned_key,
         type="password",
-        help="建議使用 Google AI Studio (https://aistudio.google.com/app/apikey) 申請之金鑰"
+        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
     )
     active_api_key = user_key.strip()
     
-    # 執行 Google 官方建議的 ListModels 實時探測
-    detected_models = []
-    list_error_msg = ""
-    
-    if active_api_key:
-        try:
-            diag_client = genai.Client(api_key=active_api_key)
-            for m in diag_client.models.list():
-                m_name = getattr(m, "name", "").replace("models/", "")
-                # 篩選出支援 generateContent 的 Gemini 模型
-                actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
-                if ("generateContent" in actions or not actions) and "gemini" in m_name.lower():
-                    detected_models.append(m_name)
-        except Exception as e:
-            list_error_msg = str(e)
-
-    # 顯示診斷狀態
-    if active_api_key:
-        if detected_models:
-            st.success(f"✅ 連線成功！共偵測到 {len(detected_models)} 個可用模型")
-            # 優先推薦排序
-            preferred_order = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-            default_index = 0
-            for idx, p in enumerate(detected_models):
-                if any(pref in p for pref in preferred_order):
-                    default_index = idx
-                    break
-                    
-            selected_model = st.selectbox(
-                "選擇辨識核心模型",
-                options=detected_models,
-                index=default_index,
-                help="清單直接來自 Google 伺服器目前對您金鑰開放的合法模型"
-            )
-        else:
-            st.error("⚠️ 您的金鑰目前無法存取任何 Gemini 模型！")
-            st.info("""
-            **如何解決？**
-            1. 前往 [Google AI Studio 官網](https://aistudio.google.com/app/apikey)
-            2. 點擊 **Create API key** 建立全新金鑰
-            3. 將該金鑰貼入上方輸入框或 Streamlit Secrets
-            """)
-            selected_model = "gemini-1.5-flash"
-    else:
-        st.warning("⚠️ 請輸入或設定 API Key")
-        selected_model = "gemini-1.5-flash"
+    # 僅提供官方已上線之標準模型
+    selected_model = st.selectbox(
+        "AI 辨識核心模型",
+        options=["gemini-2.0-flash", "gemini-1.5-flash"],
+        index=0,
+        help="推薦 gemini-2.0-flash，辨識速度最快且對表格與淺色字跡判讀力最強"
+    )
 
     max_workers = st.slider(
         "並行執行緒數",
         min_value=1,
         max_value=4,
         value=2,
-        help="免費版 API 建議設定 2；付費版可設為 3~4。"
+        help="建議設為 2，既能大幅加速又能穩定防止 Google 頻率限制 (429)"
     )
+
+    if active_api_key:
+        st.success("✅ API 金鑰已就緒")
+    else:
+        st.warning("⚠️ 請確認已在 secrets 設定或在此輸入 API Key")
 
     st.markdown("---")
     st.markdown("""
-    💡 **會計計算與防呆標準**：
+    💡 **會計計算原則**：
     * **電腦信用卡**：`信用卡刷卡(-)` 減 `信用卡退刷(+)`
     * **條碼**：`條碼支付進款(-)` 減 `條碼支付退款(+)`
     * **平衡驗證**：客運 + 貨運 - 電腦信用卡 - 條碼 + 其他 ＝ 自輸(應解總計)
@@ -157,9 +124,11 @@ def find_matching_sheet(wb, station_name):
     clean_target = clean_station_name(station_name)
     if not clean_target:
         return None
+    # 步驟 1：完全精確相符
     for s_name in wb.sheetnames:
         if clean_station_name(s_name) == clean_target:
             return wb[s_name]
+    # 步驟 2：模糊包含比對
     candidates = []
     for s_name in wb.sheetnames:
         s_clean = clean_station_name(s_name)
@@ -169,6 +138,31 @@ def find_matching_sheet(wb, station_name):
         candidates.sort(key=lambda x: abs(len(clean_station_name(x)) - len(clean_target)))
         return wb[candidates[0]]
     return None
+
+def extract_page_image_payload(page):
+    """從 PDF 頁面抽取高解析度 JPEG 原圖（純 Python，免 Poppler）"""
+    if len(page.images) > 0:
+        raw_bytes = page.images[0].data
+        try:
+            pil_img = Image.open(io.BytesIO(raw_bytes))
+            # 若圖檔尺寸超大，微幅縮小至 1800px 以極速傳輸，同時保持印刷筆劃極致清晰
+            if max(pil_img.size) > 1800:
+                ratio = 1800 / max(pil_img.size)
+                new_size = (int(pil_img.size[0] * ratio), int(pil_img.size[1] * ratio))
+                resized = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=85)
+                return ("image/jpeg", buf.getvalue())
+            return ("image/jpeg", raw_bytes)
+        except Exception:
+            return ("image/jpeg", raw_bytes)
+    else:
+        # 若為文字型 PDF 則直接輸出單頁 PDF 串流
+        writer = PdfWriter()
+        writer.add_page(page)
+        buf = io.BytesIO()
+        writer.write(buf)
+        return ("application/pdf", buf.getvalue())
 
 def load_excel_preserving_all(file_bytes, filename):
     """載入 Excel 檔案並完整保留公式結構"""
@@ -193,7 +187,6 @@ def load_excel_preserving_all(file_bytes, filename):
                     if val != "" and val is not None:
                         xlsx_sheet.cell(row=r + 1, column=c + 1, value=val)
             
-            # 針對公版車站分頁重建總計、自輸-總計與合計公式
             header_row = [str(xlsx_sheet.cell(1, c).value or "") for c in range(1, 10)]
             if any("客運" in h for h in header_row):
                 for day_r in range(2, 33):
@@ -266,22 +259,23 @@ def write_cell_if_valid(sheet, row_idx, col_idx, val):
     return 0
 
 # ----------------------------------------------------
-# 3. 單頁獨立背景辨識函式 (防限速原地重試)
+# 3. 單頁背景獨立辨識函式
 # ----------------------------------------------------
-def process_single_page_worker(task, api_key, target_model, prompt):
-    file_name, p_idx, total_p, page_bytes = task
+def process_single_page_worker(task, api_key, model_name, prompt):
+    file_name, p_idx, total_p, mime_type, payload_bytes = task
     client = genai.Client(api_key=api_key)
     
-    # 稍微隨機錯開執行緒發送時間，避免瞬間撞擊 API 限速
+    # 輕微錯開執行緒，避免瞬間觸發 API 限速
     time.sleep(random.uniform(0.3, 1.2))
 
     last_err = ""
+    # 針對同一模型原地重試，遇 429 退避等待
     for attempt in range(1, 6):
         try:
             res = client.models.generate_content(
-                model=target_model,
+                model=model_name,
                 contents=[
-                    types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
+                    types.Part.from_bytes(data=payload_bytes, mime_type=mime_type),
                     prompt
                 ],
                 config=types.GenerateContentConfig(
@@ -297,15 +291,11 @@ def process_single_page_worker(task, api_key, target_model, prompt):
                     return (file_name, p_idx, data, None)
         except Exception as e:
             last_err = str(e)
-            # 若遇 429 限速，強制退避等待，絕不切換到未授權模型
             if "429" in last_err or "RESOURCE_EXHAUSTED" in last_err:
-                sleep_time = 5.0 * attempt + random.uniform(1.0, 3.0)
+                sleep_time = 4.0 * attempt + random.uniform(1.0, 2.0)
                 time.sleep(sleep_time)
                 continue
-            # 若遇 404，代表當前金鑰無法使用此模型名稱
-            if "404" in last_err or "NOT_FOUND" in last_err:
-                return (file_name, p_idx, None, f"404 模型未授權: {target_model}")
-            time.sleep(2.0)
+            time.sleep(1.5)
             
     return (file_name, p_idx, None, last_err)
 
@@ -316,7 +306,7 @@ col1, col2 = st.columns(2)
 with col1:
     uploaded_excel = st.file_uploader("📥 步驟 1：上傳 Excel 公版 (.xlsx 或 .xls)", type=["xlsx", "xls"])
 with col2:
-    uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (支援多選同時處理)", type=["pdf"], accept_multiple_files=True)
+    uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選同時處理)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
 # 5. 核心處理引擎
@@ -328,11 +318,25 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
     if not uploaded_excel or not uploaded_pdfs:
         st.error("❌ 請確認已上傳 Excel 公版與 PDF 檔案！")
         st.stop()
-    if not detected_models:
-        st.error("❌ 目前輸入的金鑰未偵測到任何可用模型，請參閱側邊欄說明更換為 Google AI Studio 金鑰後再執行！")
-        st.stop()
 
     start_time = time.time()
+    client = genai.Client(api_key=active_api_key)
+
+    # 階段 1：執行前 1 秒連線快篩
+    status_box = st.status("📄 [階段 1/3] 正在驗證模型與拆分 PDF 頁面...", expanded=True)
+    
+    verified_model = selected_model
+    try:
+        test_res = client.models.generate_content(
+            model=selected_model,
+            contents="hello",
+            config=types.GenerateContentConfig(max_output_tokens=2)
+        )
+    except Exception as e:
+        status_box.write(f"⚠️ 模型 `{selected_model}` 回應異常，自動切換至備用主力 `gemini-1.5-flash`...")
+        verified_model = "gemini-1.5-flash"
+
+    status_box.write(f"🎯 核心模型已鎖定：`{verified_model}`")
 
     # 載入 Excel
     try:
@@ -341,9 +345,7 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         st.error(f"❌ Excel 讀取失敗：{e}")
         st.stop()
 
-    status_box = st.status("📄 [階段 1/3] 正在拆分所有 PDF 頁面...", expanded=True)
-    
-    # 拆分所有 PDF 頁面
+    # 高速抽取 PDF 掃描圖檔
     all_pages = []
     for pdf_file in uploaded_pdfs:
         try:
@@ -351,11 +353,8 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
             total_p = len(reader.pages)
             status_box.write(f"🔍 讀入檔案 `{pdf_file.name}`（共 {total_p} 頁）")
             for p_idx, page in enumerate(reader.pages, 1):
-                writer = PdfWriter()
-                writer.add_page(page)
-                page_buf = io.BytesIO()
-                writer.write(page_buf)
-                all_pages.append((pdf_file.name, p_idx, total_p, page_buf.getvalue()))
+                mime_type, payload_bytes = extract_page_image_payload(page)
+                all_pages.append((pdf_file.name, p_idx, total_p, mime_type, payload_bytes))
         except Exception as e:
             status_box.write(f"⚠️ 檔案 `{pdf_file.name}` 讀取異常：{e}")
 
@@ -364,7 +363,7 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
         status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
         st.stop()
 
-    status_box.update(label=f"🚀 [階段 2/3] 鎖定模型 `{selected_model}`，啟動 {max_workers} 執行緒並行辨識全數 {total_tasks} 頁單據...", state="running")
+    status_box.update(label=f"🚀 [階段 2/3] 啟動 {max_workers} 執行緒並行辨識全數 {total_tasks} 頁單據...", state="running")
 
     prompt = """
     你是一位具備會計勾稽專業的台鐵表單辨識專家。請仔細辨識這張站務解款單據影像：
@@ -394,7 +393,7 @@ if st.button("🚀 開始極速自動辨識與填表", type="primary", use_conta
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_task = {
-            executor.submit(process_single_page_worker, task, active_api_key, selected_model, prompt): task
+            executor.submit(process_single_page_worker, task, active_api_key, verified_model, prompt): task
             for task in all_pages
         }
         
