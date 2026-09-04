@@ -1,459 +1,250 @@
 import io
+import json
 import os
-import time
+import re
+import tempfile
+import google.generativeai as genai
 import openpyxl
 import pandas as pd
-from pydantic import BaseModel, Field
-from pypdf import PdfReader, PdfWriter
 import streamlit as st
-from google import genai
-from google.genai import types
 
-# ----------------------------------------------------
-# 1. 網頁基本設定與金鑰讀取
-# ----------------------------------------------------
-st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
-st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🚀 完整保留原始公式與格式 ｜ ⚖️ 會計立場扣抵公式 (=刷卡-退刷) ｜ 🔍 自動檢核自輸總計")
+# 頁面配置
+st.set_page_config(page_title="台鐵解款單自動彙總系統", layout="wide")
+st.title("🚆 台鐵站務解款單 自動彙總填報系統")
 
-raw_key = st.secrets.get("GEMINI_API_KEY", "")
-cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
+# 側邊欄設定
+st.sidebar.header("🔑 金鑰與模型設定")
+api_key = st.sidebar.text_input(
+    "Google Gemini API Key",
+    value=st.secrets.get("GEMINI_API_KEY", ""),
+    type="password",
+    help="請輸入 Google AI Studio 申請的 API Key",
+)
+model_name = st.sidebar.selectbox("Gemini 模型", ["gemini-2.5-flash", "gemini-1.5-flash"], index=0)
 
-with st.sidebar:
-    st.header("⚙️ 系統設定")
-    user_key = st.text_input(
-        "Gemini API Key",
-        value=cleaned_key,
-        type="password",
-        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
-    )
-    active_api_key = user_key.strip()
-    
-    # 動態探測此 API Key 支援的所有模型清單（保證不發生 404）
-    available_models = []
-    if active_api_key:
-        try:
-            temp_client = genai.Client(api_key=active_api_key)
-            for m in temp_client.models.list():
-                m_name = getattr(m, "name", "").replace("models/", "")
-                if "gemini" in m_name.lower():
-                    available_models.append(m_name)
-        except Exception:
-            pass
+# 標準車站清單（豐富至二水）
+STATIONS = [
+    "豐富", "苗栗", "銅鑼", "三義", "泰安", "后里", "豐原", "栗林",
+    "潭子", "頭家厝", "松竹", "太原", "精武", "臺中", "五權", "大慶",
+    "烏日", "新烏日", "成功", "彰化", "花壇", "大村", "員林", "社頭",
+    "田中", "二水"
+]
 
-    if not available_models:
-        available_models = [
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
-        ]
+AI_PROMPT = """
+你是一個專業的台鐵會計單據辨識專家。請分析這份「站務解款單」掃描文件（每一頁為一個車站）。
+請逐頁辨識，並輸出為標準 JSON 陣列格式。
 
-    # 預設優先選擇 flash 系列（速度最快）
-    default_idx = 0
-    for i, name in enumerate(available_models):
-        if "flash" in name.lower():
-            default_idx = i
-            break
+注意細節：
+1. 站名請去除代號與「站」字（例如「3150_豐富站」請提取「豐富」；「臺中」或「台中」請統一輸出為「臺中」）。
+2. 日期請務必提取「進款日期」（格式 YYYY-MM-DD），不要抓列印時間或簽核時間。
+3. 客運(+)金額請轉為正整數（若有客運[離線](+)請相加）。
+4. 信用卡刷卡(-) 與 信用卡退刷(+) 必須分開提取為正整數（無退刷請填 0）。
+5. 條碼支付進款(-) 與 條碼支付退款(+) 必須分開提取為正整數（無退款請填 0）。
+6. 若有「繳回週轉金(+)」請提取，無則填 0。
+7. 貨運(+)、存付運費(+)、託收支票、補繳金額等若有請提取。
 
-    selected_model = st.selectbox(
-        "AI 辨識核心模型",
-        options=available_models,
-        index=default_idx,
-        help="系統已自動連線並篩選出您金鑰支援的模型"
-    )
+輸出格式範例（純 JSON 陣列，不要多餘註解）：
+[
+  {
+    "station_name": "豐富",
+    "date": "2026-08-28",
+    "passenger": 26491,
+    "credit_charge": 2233,
+    "credit_refund": 0,
+    "barcode_charge": 287,
+    "barcode_refund": 0,
+    "revolving_fund": 0,
+    "total_due": 23971,
+    "total_actual": 23971
+  }
+]
+"""
 
-    if active_api_key:
-        st.success("✅ API 金鑰連線正常")
-    else:
-        st.warning("⚠️ 請確認已在 secrets 設定或在此輸入 API Key")
+def extract_pdf_data(pdf_file, key, model_choice):
+    """呼叫 Gemini 視覺 API 提取 PDF 內解款單數據"""
+    genai.configure(api_key=key)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_file.read())
+        tmp_path = tmp.name
 
-    st.markdown("---")
-    st.markdown("""
-    💡 **會計計算原則**：
-    * **電腦信用卡**：`信用卡刷卡(-)` 減 `信用卡退刷(+)`
-    * **條碼**：`條碼支付進款(-)` 減 `條碼支付退款(+)`
-    * **平衡檢核**：客運 + 貨運 - 電腦信用卡 - 條碼 + 其他 ＝ 自輸(應解總計)
-    """)
-
-# ----------------------------------------------------
-# 2. 定義資料結構與工具函式
-# ----------------------------------------------------
-class StationReport(BaseModel):
-    station_name: str = Field(description="車站名稱（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，不需包含'站'字）")
-    date_day: int = Field(description="報表日期中的『日/號』(1 至 31 的整數數字)")
-    passenger_revenue: float = Field(default=0.0, description="左側【應解款數】區塊內的『客運(+)』金額，無則為 0")
-    freight_revenue: float = Field(default=0.0, description="左側【應解款數】區塊內的『貨運(+)』金額，無則為 0")
-    credit_card_charge: float = Field(default=0.0, description="左側【應解款數】區塊內的『信用卡刷卡(-)』金額 (填正數)，無則為 0")
-    credit_card_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『信用卡退刷(+)』金額 (填正數)，無則為 0")
-    barcode_in: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付進款(-)』金額 (填正數)，無則為 0")
-    barcode_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付退款(+)』金額 (填正數)，無則為 0")
-    other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細金額加總（如存付運費、託收支票、補繳金額、繳回週轉金、其他短欠等），若無則填 0")
-    remittance_total: float = Field(default=0.0, description="左側【應解款數】區塊內的『應解總計』金額")
-
-def extract_json_str(text: str) -> str:
-    """安全去除 Markdown 標籤以解析 JSON"""
-    if not text:
-        return "{}"
-    t = text.strip()
-    if t.startswith("```"):
-        lines = t.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        t = "\n".join(lines).strip()
-    return t
-
-def clean_station_name(val):
-    """標準化車站名稱以利比對工作表名稱"""
-    if not val:
-        return ""
-    return str(val).replace("臺", "台").replace("站", "").replace(" ", "").replace("　", "").strip()
-
-def to_clean_num(val):
-    """轉換為乾淨整數或保留小數"""
     try:
-        f_val = float(val)
-        return int(f_val) if f_val.is_integer() else f_val
-    except Exception:
-        return 0
+        uploaded_file = genai.upload_file(tmp_path, mime_type="application/pdf")
+        model = genai.GenerativeModel(
+            model_name=model_choice,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        response = model.generate_content([uploaded_file, AI_PROMPT])
+        data = json.loads(response.text)
+        return data
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-def build_deduction_formula(charge_val, refund_val):
-    """會計立場相減公式：=刷卡-退刷"""
-    c = to_clean_num(charge_val)
-    r = to_clean_num(refund_val)
-    if c == 0 and r == 0:
-        return None
-    if c > 0 and r > 0:
-        return f"={c}-{r}"
-    if c > 0 and r == 0:
-        return c
-    if c == 0 and r > 0:
-        return f"=-{r}"
-    return None
+def find_target_sheet(wb, date_str):
+    """根據進款日期配對工作表（支援 28、8.28、8月28日、0828 等命名）"""
+    parts = date_str.split("-")
+    if len(parts) == 3:
+        month, day = str(int(parts[1])), str(int(parts[2]))
+        day_pad = f"{int(day):02d}"
+        candidates = [
+            day, f"{day}日", f"{month}.{day}", f"{month}/{day}",
+            f"{month}月{day}日", f"{int(month):02d}{day_pad}", date_str
+        ]
+        for cand in candidates:
+            if cand in wb.sheetnames:
+                return wb[cand]
+        for name in wb.sheetnames:
+            for cand in candidates:
+                if cand in name:
+                    return wb[name]
+    return wb.active
 
-def load_excel_preserving_all(file_bytes, filename):
-    """載入 Excel 並全力保護原始公式與格式"""
-    if filename.lower().endswith(".xls"):
-        try:
-            import xlrd
-        except ImportError:
-            raise ImportError("請在 requirements.txt 中加入 xlrd。")
-
-        xls_book = xlrd.open_workbook(file_contents=file_bytes, formatting_info=False)
-        wb = openpyxl.Workbook()
-        wb.remove(wb.active)
-        
-        for sheet_name in xls_book.sheet_names():
-            xls_sheet = xls_book.sheet_by_name(sheet_name)
-            xlsx_sheet = wb.create_sheet(title=sheet_name)
-            for r in range(xls_sheet.nrows):
-                for c in range(xls_sheet.ncols):
-                    cell = xls_sheet.cell(r, c)
-                    val = cell.value
-                    if cell.ctype == xlrd.XL_CELL_DATE:
-                        try:
-                            val = xlrd.xldate.xldate_as_datetime(val, xls_book.datemode)
-                        except Exception:
-                            pass
-                    if val != "" and val is not None:
-                        xlsx_sheet.cell(row=r + 1, column=c + 1, value=val)
-            
-            header_row = [str(xlsx_sheet.cell(1, c).value or "") for c in range(1, 10)]
-            if any("客運" in h for h in header_row):
-                for day_r in range(2, 33):
-                    xlsx_sheet.cell(row=day_r, column=8, value=f"=B{day_r}+C{day_r}-D{day_r}-E{day_r}+F{day_r}")
-                    xlsx_sheet.cell(row=day_r, column=9, value=f"=G{day_r}-H{day_r}")
-        return wb
-    else:
-        return openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
-
-def analyze_sheet_structure(sheet):
-    """智慧掃描工作表表頭取得各欄位位置"""
+def get_mapping(ws):
+    """掃描公版定位各車站行數與科目欄位，不破壞原有儲存格"""
+    station_rows = {}
     col_map = {}
-    for r in range(1, 8):
-        for c in range(1, sheet.max_column + 1):
-            val = str(sheet.cell(row=r, column=c).value or "").replace(" ", "").replace("\n", "").strip()
+
+    # 1. 定位車站行號
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, min(ws.max_column + 1, 8)):
+            val = str(ws.cell(row=r, column=c).value or "").strip().replace(" ", "")
             if not val:
                 continue
-            if "客運" in val and "passenger" not in col_map:
-                col_map["passenger"] = c
-            elif "貨運" in val and "freight" not in col_map:
-                col_map["freight"] = c
-            elif ("信用卡" in val or "刷卡" in val) and "credit" not in col_map:
-                col_map["credit"] = c
-            elif ("條碼" in val or "支付" in val) and "barcode" not in col_map:
-                col_map["barcode"] = c
-            elif "其他" in val and "other" not in col_map:
-                col_map["other"] = c
-            elif ("自輸" in val or "字輸" in val) and "remittance" not in col_map:
-                col_map["remittance"] = c
-            elif ("日" in val or "期" in val or "號" in val) and "date" not in col_map:
-                col_map["date"] = c
-
-    defaults = {
-        "date": 1,
-        "passenger": 2,
-        "freight": 3,
-        "credit": 4,
-        "barcode": 5,
-        "other": 6,
-        "remittance": 7
-    }
-    for k, v in defaults.items():
-        if k not in col_map:
-            col_map[k] = v
-    return col_map
-
-def find_target_row(sheet, date_day, date_col=1):
-    """精準尋找對應日期的列號 (1~31)"""
-    for r in range(1, 50):
-        val = sheet.cell(row=r, column=date_col).value
-        if val is not None:
-            try:
-                val_str = str(val).replace("日", "").replace("號", "").strip()
-                if int(float(val_str)) == int(date_day):
-                    return r
-            except Exception:
-                pass
-    return int(date_day) + 1
-
-def write_cell_if_valid(sheet, row_idx, col_idx, val):
-    """安全寫入指定儲存格（0 或空值不寫入）"""
-    if val is not None and val != 0 and val != "0" and val != "":
-        if col_idx:
-            sheet.cell(row=row_idx, column=col_idx, value=val)
-            return 1
-    return 0
-
-# ----------------------------------------------------
-# 3. 介面上傳區塊
-# ----------------------------------------------------
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_excel = st.file_uploader("📥 步驟 1：上傳 Excel 公版 (.xlsx 或 .xls)", type=["xlsx", "xls"])
-with col2:
-    uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選)", type=["pdf"], accept_multiple_files=True)
-
-# ----------------------------------------------------
-# 4. 核心辨識與填寫
-# ----------------------------------------------------
-if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_container_width=True):
-    if not active_api_key:
-        st.error("❌ 尚未設定 Gemini API Key，請在側邊欄輸入！")
-        st.stop()
-    if not uploaded_excel or not uploaded_pdfs:
-        st.error("❌ 請確認已同時上傳 Excel 公版與 PDF 檔案！")
-        st.stop()
-
-    start_time = time.time()
-    client = genai.Client(api_key=active_api_key)
-
-    try:
-        wb = load_excel_preserving_all(uploaded_excel.getvalue(), uploaded_excel.name)
-    except Exception as e:
-        st.error(f"❌ Excel 讀取失敗：{e}")
-        st.stop()
-
-    status_box = st.status("📄 [階段 1/2] 正在讀取與拆分 PDF 頁面...", expanded=True)
-    all_pages = []
-    
-    for pdf_file in uploaded_pdfs:
-        status_box.write(f"🔍 讀取檔案 `{pdf_file.name}` ...")
-        try:
-            reader = PdfReader(io.BytesIO(pdf_file.getvalue()))
-            total_p = len(reader.pages)
-            for p_idx, page in enumerate(reader.pages, 1):
-                writer = PdfWriter()
-                writer.add_page(page)
-                page_buf = io.BytesIO()
-                writer.write(page_buf)
-                all_pages.append((pdf_file.name, p_idx, total_p, page_buf.getvalue()))
-        except Exception as e:
-            status_box.write(f"⚠️ 檔案 `{pdf_file.name}` 解析異常：{e}")
-
-    total_tasks = len(all_pages)
-    if total_tasks == 0:
-        status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
-        st.stop()
-
-    status_box.update(label=f"🚀 [階段 2/2] 正在辨識 {total_tasks} 頁解款單據並填寫 Excel...", state="running")
-    
-    # 強化淺色印件識別與會計勾稽驗算
-    prompt = """
-    你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據：
-    【特別注意淺色印件】：
-    本單據若為影印本，字跡、複寫痕跡或印泥顏色可能較淺，請特別仔細分辨淺色或模糊數字（如 0、3、8、1、7），切勿遺漏淺色墨跡。
-    1. 擷取【車站名稱】（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，不需包含'站'字）與進款【日期】（僅需日/號數，1-31 的整數）。
-    2. 專注看左側【應解款數】大項目區塊，精確擷取各數值（若無填 0）：
-       - 客運(+)
-       - 貨運(+)
-       - 信用卡刷卡(-) (填正數)
-       - 信用卡退刷(+) (填正數)
-       - 條碼支付進款(-) (填正數)
-       - 條碼支付退款(+) (填正數)
-       - 應解總計 (報表上的應解總計數值)
-       - 其他項目加總（若有存付運費、託收支票、補繳金額、繳回週轉金、自售機短欠等款項，請計算其淨額填入其他；若無則填 0）
-    3. 會計勾稽驗算原則：正常情況下必符合「客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計」。若遇到淺色不確定字跡，請務必利用此勾稽平衡原則反推驗算確認！
-    """
-
-    models_to_try = [selected_model] + [m for m in available_models if m != selected_model]
-
-    results_data = []
-    audit_records = []
-    progress_bar = st.progress(0)
-    
-    for idx, (file_name, p_idx, total_p, page_bytes) in enumerate(all_pages, 1):
-        progress_bar.progress(idx / total_tasks, text=f"正在辨識第 {idx}/{total_tasks} 頁...")
-        
-        parsed_data = None
-        err_msg = ""
-        
-        # 輪詢探測可用模型；一旦某模型成功，立即將該模型調至第一位，後續頁面 100% 直通無延遲
-        for model_name in list(models_to_try):
-            success = False
-            for retry in range(2):
-                try:
-                    res = client.models.generate_content(
-                        model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=page_bytes, mime_type="application/pdf"),
-                            prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=StationReport,
-                            temperature=0.0,
-                        )
-                    )
-                    if res and res.text:
-                        clean_text = extract_json_str(res.text)
-                        parsed_data = StationReport.model_validate_json(clean_text)
-                        # 核心優化：記住成功模型，後續頁面直接置頂呼叫，不再試無效模型
-                        if models_to_try[0] != model_name:
-                            models_to_try.remove(model_name)
-                            models_to_try.insert(0, model_name)
-                        success = True
-                        break
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                        time.sleep(4.0)
-                        continue
-                    else:
-                        # 遇 404 或其他錯誤，直接換下一個模型測試
-                        break
-            if success:
-                break
-
-        if parsed_data and parsed_data.date_day > 0:
-            results_data.append((file_name, p_idx, parsed_data))
-            status_box.write(f"✅ [{idx:02d}/{total_tasks:02d}] **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功")
-        else:
-            status_box.write(f"⚠️ [{idx:02d}/{total_tasks:02d}] `{file_name}` 第 {p_idx} 頁辨識失敗 ({err_msg[:60]}...)")
-        
-        time.sleep(1.0)
-
-    # ----------------------------------------------------
-    # 5. 回填 Excel 與 會計立場平衡檢查
-    # ----------------------------------------------------
-    total_written = 0
-    success_count = 0
-
-    for file_name, p_idx, data in results_data:
-        target_name_clean = clean_station_name(data.station_name)
-        
-        # 優先完全符合（防止「烏日」被「新烏日」搶先匹配）
-        target_sheet = None
-        for s_name in wb.sheetnames:
-            if clean_station_name(s_name) == target_name_clean:
-                target_sheet = wb[s_name]
-                break
-        if not target_sheet:
-            for s_name in wb.sheetnames:
-                s_clean = clean_station_name(s_name)
-                if s_clean and (s_clean in target_name_clean or target_name_clean in s_clean):
-                    target_sheet = wb[s_name]
+            for st_name in STATIONS:
+                matched = False
+                if st_name == "臺中":
+                    if "臺中" in val or "台中" in val:
+                        matched = True
+                elif st_name in val:
+                    matched = True
+                if matched and st_name not in station_rows:
+                    station_rows[st_name] = r
                     break
 
-        net_credit = data.credit_card_charge - data.credit_card_refund
-        net_barcode = data.barcode_in - data.barcode_refund
+    # 2. 定位標題欄號
+    min_row = min(station_rows.values()) if station_rows else 6
+    for r in range(1, min_row):
+        for c in range(1, ws.max_column + 1):
+            val = str(ws.cell(row=r, column=c).value or "").strip().replace(" ", "").replace("\n", "")
+            if "客運" in val and "客運" not in col_map:
+                col_map["客運"] = c
+            elif ("信用卡" in val or "電腦信用卡" in val) and "信用卡" not in col_map:
+                col_map["信用卡"] = c
+            elif "條碼" in val and "條碼" not in col_map:
+                col_map["條碼"] = c
+            elif ("週轉金" in val or "周轉金" in val) and "週轉金" not in col_map:
+                col_map["週轉金"] = c
 
-        computed_total = data.passenger_revenue + data.freight_revenue - net_credit - net_barcode + data.other_amount
-        diff = round(data.remittance_total - computed_total, 2)
-        is_balanced = (abs(diff) < 0.01)
+    return station_rows, col_map
 
-        audit_records.append({
-            "檔案名稱": file_name,
-            "車站名稱": data.station_name,
-            "日期": f"{data.date_day} 日",
-            "客運": to_clean_num(data.passenger_revenue),
-            "貨運": to_clean_num(data.freight_revenue),
-            "電腦信用卡 (=刷卡-退刷)": f"{to_clean_num(data.credit_card_charge)} - {to_clean_num(data.credit_card_refund)}" if data.credit_card_refund > 0 else to_clean_num(data.credit_card_charge),
-            "條碼 (=進款-退款)": f"{to_clean_num(data.barcode_in)} - {to_clean_num(data.barcode_refund)}" if data.barcode_refund > 0 else to_clean_num(data.barcode_in),
-            "其他": to_clean_num(data.other_amount),
-            "自輸 (PDF應解總計)": to_clean_num(data.remittance_total),
-            "計算總計": to_clean_num(computed_total),
-            "差額 (自輸-總計)": diff,
-            "平衡狀態": "✅ 平衡 (0)" if is_balanced else f"❌ 差額 {diff:+.0f} (請核對)",
-            "工作表寫入": f"已寫入 [{target_sheet.title}]" if target_sheet else "❌ 找不到分頁"
-        })
+# 檔案上傳介面
+col1, col2 = st.columns(2)
+with col1:
+    template_file = st.file_uploader(
+        "1. 上傳公版 Excel 範本 (.xlsx)",
+        type=["xlsx"],
+        help="請務必使用 .xlsx 格式以保留原表內的所有公式與排版格式！"
+    )
+with col2:
+    pdf_files = st.file_uploader(
+        "2. 上傳掃描解款單 PDF（可多選）",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
 
-        if not target_sheet:
+if st.button("🚀 開始辨識並寫入公版", type="primary"):
+    if not api_key:
+        st.error("請在側邊欄填入 Google Gemini API Key！")
+        st.stop()
+    if not template_file or not pdf_files:
+        st.error("請同時上傳「公版範本」與「解款單 PDF」！")
+        st.stop()
+
+    # 載入公版，保留所有原本公式與樣式
+    wb = openpyxl.load_workbook(template_file, data_only=False)
+
+    all_results = []
+    progress_bar = st.progress(0)
+
+    for idx, pdf in enumerate(pdf_files):
+        st.write(f"正在分析單據：**{pdf.name}**...")
+        try:
+            records = extract_pdf_data(pdf, api_key, model_name)
+        except Exception as e:
+            st.error(f"辨識 {pdf.name} 失敗：{e}")
             continue
 
-        col_map = analyze_sheet_structure(target_sheet)
-        target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
+        for item in records:
+            st_name = item.get("station_name", "").replace("站", "").strip()
+            date_str = item.get("date", "")
+            passenger = item.get("passenger", 0)
+            c_charge = item.get("credit_charge", 0)
+            c_refund = item.get("credit_refund", 0)
+            b_charge = item.get("barcode_charge", 0)
+            b_refund = item.get("barcode_refund", 0)
+            revolving = item.get("revolving_fund", 0)
 
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
-        
-        cc_formula = build_deduction_formula(data.credit_card_charge, data.credit_card_refund)
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
+            # 計算公式生成：有退刷/退款時保留運算式（例如 =100-10）
+            if c_refund > 0:
+                credit_val = f"={c_charge}-{c_refund}"
+            elif c_charge > 0:
+                credit_val = c_charge
+            else:
+                credit_val = 0
 
-        bc_formula = build_deduction_formula(data.barcode_in, data.barcode_refund)
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
+            if b_refund > 0:
+                barcode_val = f"={b_charge}-{b_refund}"
+            elif b_charge > 0:
+                barcode_val = b_charge
+            else:
+                barcode_val = 0
 
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount))
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total))
+            # 寫入 Excel（僅更動對應儲存格）
+            ws = find_target_sheet(wb, date_str)
+            station_rows, col_map = get_mapping(ws)
 
-        success_count += 1
+            # 容錯比對臺中
+            matched_st = "臺中" if st_name in ["臺中", "台中"] else st_name
+            row_idx = station_rows.get(matched_st)
 
-    status_box.update(label="🎉 辨識與 Excel 寫入完成！", state="complete")
-    progress_bar.empty()
+            if row_idx:
+                if "客運" in col_map:
+                    ws.cell(row=row_idx, column=col_map["客運"], value=passenger)
+                if "信用卡" in col_map:
+                    ws.cell(row=row_idx, column=col_map["信用卡"], value=credit_val)
+                if "條碼" in col_map:
+                    ws.cell(row=row_idx, column=col_map["條碼"], value=barcode_val)
+                if "週轉金" in col_map and revolving > 0:
+                    ws.cell(row=row_idx, column=col_map["週轉金"], value=revolving)
 
-    out_stream = io.BytesIO()
-    wb.save(out_stream)
-    out_stream.seek(0)
-    elapsed = time.time() - start_time
+            all_results.append({
+                "來源檔案": pdf.name,
+                "進款日期": date_str,
+                "車站": st_name,
+                "客運(+)": passenger,
+                "電腦信用卡(算式/值)": credit_val,
+                "條碼支付(算式/值)": barcode_val,
+                "繳回週轉金": revolving,
+                "狀態": "已填入" if row_idx else "找不到對應行"
+            })
 
-    st.balloons()
-    st.success(f"✨ 處理完成！耗時 {elapsed:.1f} 秒，共成功處理 {success_count}/{total_tasks} 頁單據，填寫了 {total_written} 個儲存格！")
+        progress_bar.progress((idx + 1) / len(pdf_files))
 
-    # ----------------------------------------------------
-    # 6. 會計平衡檢核儀表板
-    # ----------------------------------------------------
-    st.subheader("⚖️ 單據會計平衡勾稽核對表")
-    if audit_records:
-        df_audit = pd.DataFrame(audit_records)
-        
-        unbalanced_count = sum(1 for r in audit_records if "❌" in r["平衡狀態"])
-        if unbalanced_count > 0:
-            st.error(f"⚠️ 警告：共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請依下方表格核對單據金額是否有誤！")
-        else:
-            st.success("🎯 太棒了！所有辨識成功的單據「自輸 - 總計」皆等於 0，會計平衡完全正確！")
+    # 輸出修改後的公版檔案
+    output_stream = io.BytesIO()
+    wb.save(output_stream)
+    output_stream.seek(0)
 
-        st.dataframe(
-            df_audit,
-            use_container_width=True,
-            hide_index=True
-        )
+    st.success("🎉 所有單據處理完成！公版原有之總計與公式已完整保留。")
 
     st.download_button(
-        label="📥 點擊下載已自動填寫完成的 Excel 報表 (.xlsx)",
-        data=out_stream,
+        label="📥 下載彙總完成表 (保留公版公式與格式)",
+        data=output_stream,
         file_name="台鐵解款單_彙總完成表.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    # 顯示辨識明細預覽
+    if all_results:
+        st.subheader("📋 辨識與寫入明細預覽")
+        st.dataframe(pd.DataFrame(all_results), use_container_width=True)
