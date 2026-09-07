@@ -1,3 +1,7 @@
 streamlit
 openpyxl
+pypdf
+google-genai
+pandas
+pydantic
 google-generativeai
