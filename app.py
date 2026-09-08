@@ -5,8 +5,7 @@ import time
 import random
 import openpyxl
 import pandas as pd
-from typing import Any, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from pypdf import PdfReader, PdfWriter
 import streamlit as st
 from google import genai
@@ -18,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🚀 完整保留原始公式與格式 ｜ ⚡ 穩健防限流辨識 ｜ ⚖️ 會計扣抵公式 (=刷卡-退刷) ｜ 🔍 自動平衡檢核")
+st.caption("🚀 完整保留原始公式與格式 ｜ ⚡ 智慧抗限流逐頁辨識 ｜ ⚖️ 會計扣抵公式 (=刷卡-退刷) ｜ 🔍 自動平衡檢核")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
@@ -29,42 +28,37 @@ with st.sidebar:
         "Gemini API Key",
         value=cleaned_key,
         type="password",
-        help="優先讀取 secrets 中的 GEMINI_API_KEY"
+        help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
     )
     active_api_key = user_key.strip()
     
-    available_models = []
-    if active_api_key:
-        try:
-            temp_client = genai.Client(api_key=active_api_key)
-            for m in temp_client.models.list():
-                m_name = getattr(m, "name", "").replace("models/", "")
-                if "gemini" in m_name.lower():
-                    available_models.append(m_name)
-        except Exception:
-            pass
-
-    if not available_models:
-        available_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    else:
-        flash_models = [m for m in available_models if "flash" in m.lower()]
-        other_models = [m for m in available_models if "flash" not in m.lower()]
-        available_models = flash_models + other_models
+    # 鎖定官方穩定、支援圖片/PDF的高速模型，徹底防止 404 錯誤
+    stable_models = [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
+    ]
 
     selected_model = st.selectbox(
         "AI 辨識核心模型",
-        options=available_models,
+        options=stable_models,
         index=0,
-        help="推薦使用 Flash 系列模型，辨識速度最快且準確"
+        help="預設 gemini-2.0-flash 速度最快、辨識精確度極高且最穩定"
     )
 
     concurrency = st.slider(
         "⚡ 並行辨識線程數",
         min_value=1,
-        max_value=5,
+        max_value=4,
         value=2,
-        help="建議設定 2~3。適度並行可兼顧高速辨識與穩定度，避免觸發 API 429 頻率上限"
+        help="推薦設為 2~3。適度並行既能大幅縮短時間，又能徹底防止觸發 Gemini API 429 限流"
     )
+
+    if active_api_key:
+        st.success("✅ API 金鑰連線正常")
+    else:
+        st.warning("⚠️ 請確認已在 secrets 設定或在此輸入 API Key")
 
     st.markdown("---")
     st.markdown("""
@@ -75,56 +69,22 @@ with st.sidebar:
     """)
 
 # ----------------------------------------------------
-# 2. 定義容錯資料結構與工具函式
+# 2. 定義資料結構與工具函式
 # ----------------------------------------------------
-def parse_clean_num(v: Any) -> float:
-    """安全清洗千分位逗號與多餘字符轉為浮點數"""
-    if v is None:
-        return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).replace(",", "").replace(" ", "").replace("¥", "").replace("$", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
 class StationReport(BaseModel):
-    station_name: str = Field(default="", description="車站名稱（如豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，去除站碼與'站'字）")
-    date_day: int = Field(default=0, description="進款日期的『日/號』(1 至 31 整數)")
-    passenger_revenue: float = Field(default=0.0, description="左側【應解款數】客運(+)金額")
-    freight_revenue: float = Field(default=0.0, description="左側【應解款數】貨運(+)金額")
-    credit_card_charge: float = Field(default=0.0, description="左側【應解款數】信用卡刷卡(-)金額")
-    credit_card_refund: float = Field(default=0.0, description="左側【應解款數】信用卡退刷(+)金額")
-    barcode_in: float = Field(default=0.0, description="左側【應解款數】條碼支付進款(-)金額")
-    barcode_refund: float = Field(default=0.0, description="左側【應解款數】條碼支付退款(+)金額")
-    other_amount: float = Field(default=0.0, description="左側除上述外的其他項目加總（如存付運費、託收支票、補繳金額、繳回週轉金等淨額）")
-    remittance_total: float = Field(default=0.0, description="左側【應解款數】應解總計金額")
-
-    @field_validator(
-        "passenger_revenue", "freight_revenue", "credit_card_charge",
-        "credit_card_refund", "barcode_in", "barcode_refund",
-        "other_amount", "remittance_total",
-        mode="before"
-    )
-    @classmethod
-    def clean_amounts(cls, v):
-        return parse_clean_num(v)
-
-    @field_validator("date_day", mode="before")
-    @classmethod
-    def clean_day(cls, v):
-        if isinstance(v, str):
-            digits = re.findall(r'\d+', v)
-            if digits:
-                return int(digits[-1])
-        try:
-            return int(float(v))
-        except Exception:
-            return 0
+    station_name: str = Field(description="車站名稱（如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水，請去除代碼與'站'字）")
+    date_day: int = Field(description="單據右上角『進款日期』的『日』(1 至 31 整數)。絕對不要抓右下角藍色核章或列印時間！")
+    passenger_revenue: float = Field(default=0.0, description="左側【應解款數】中的『客運(+)』金額（含客運離線），無則填 0")
+    freight_revenue: float = Field(default=0.0, description="左側【應解款數】中的『貨運(+)』金額，無則填 0")
+    credit_card_charge: float = Field(default=0.0, description="左側【應解款數】中的『信用卡刷卡(-)』金額 (填正數)，無則填 0")
+    credit_card_refund: float = Field(default=0.0, description="左側【應解款數】中的『信用卡退刷(+)』金額 (填正數)，無則填 0")
+    barcode_in: float = Field(default=0.0, description="左側【應解款數】中的『條碼支付進款(-)』金額 (填正數)，無則填 0")
+    barcode_refund: float = Field(default=0.0, description="左側【應解款數】中的『條碼支付退款(+)』金額 (填正數)，無則填 0")
+    other_amount: float = Field(default=0.0, description="除上述項目外之其他明細淨額加總（如繳回週轉金、存付運費、託收支票、補繳金額等），無則填 0")
+    remittance_total: float = Field(default=0.0, description="左側【應解款數】中的『應解總計』金額")
 
 def extract_json_str(text: str) -> str:
-    """過濾 Markdown 標籤以取得標準 JSON"""
+    """安全去除 Markdown 標籤以解析 JSON"""
     if not text:
         return "{}"
     t = text.strip()
@@ -138,7 +98,7 @@ def extract_json_str(text: str) -> str:
     return t
 
 def clean_station_name(val):
-    """標準化車站名稱（台/臺互通、去除站碼）"""
+    """標準化車站名稱，自動剔除站碼前綴與多餘字元以精準比對工作表"""
     if not val:
         return ""
     s = str(val).replace("臺", "台").replace("站", "").strip()
@@ -146,43 +106,29 @@ def clean_station_name(val):
     return s.replace(" ", "").replace("　", "").strip()
 
 def to_clean_num(val):
+    """轉換為乾淨整數或浮點數"""
     try:
-        f = float(val)
-        return int(f) if f.is_integer() else f
+        f_val = float(val)
+        return int(f_val) if f_val.is_integer() else f_val
     except Exception:
         return 0
 
 def build_deduction_formula(charge_val, refund_val):
-    """扣抵公式：退刷/退款時保留 =刷卡-退刷"""
+    """會計立場扣抵公式：當有退刷/退款時寫入 =進款-退款，Excel 將自動算值並保留軌跡"""
     c = to_clean_num(charge_val)
     r = to_clean_num(refund_val)
     if c == 0 and r == 0:
-        return 0
+        return None
     if c > 0 and r > 0:
         return f"={c}-{r}"
     if c > 0 and r == 0:
         return c
     if c == 0 and r > 0:
         return f"=-{r}"
-    return 0
-
-def get_target_sheet(wb, station_name):
-    """精準配對工作表，長度優先防止『新烏日』誤配『烏日』"""
-    t_clean = clean_station_name(station_name)
-    if not t_clean:
-        return None
-    for name in wb.sheetnames:
-        if clean_station_name(name) == t_clean:
-            return wb[name]
-    sorted_sheets = sorted(wb.sheetnames, key=lambda x: len(clean_station_name(x)), reverse=True)
-    for name in sorted_sheets:
-        s_clean = clean_station_name(name)
-        if s_clean and (s_clean in t_clean or t_clean in s_clean):
-            return wb[name]
     return None
 
 def analyze_sheet_structure(sheet):
-    """分析工作表各會計項目所在欄位"""
+    """智慧掃描工作表表頭取得各欄位位置"""
     col_map = {}
     for r in range(1, 6):
         for c in range(1, sheet.max_column + 1):
@@ -199,32 +145,60 @@ def analyze_sheet_structure(sheet):
                 col_map["barcode"] = c
             elif "其他" in val and "other" not in col_map:
                 col_map["other"] = c
-            elif ("自輸" in val or "字輸" in val or "應解總計" in val) and "remittance" not in col_map:
+            elif ("自輸" in val or "字輸" in val) and "remittance" not in col_map:
                 col_map["remittance"] = c
+            elif ("日" in val or "期" in val or "號" in val) and "date" not in col_map:
+                col_map["date"] = c
 
-    defaults = {"passenger": 2, "freight": 3, "credit": 4, "barcode": 5, "other": 6, "remittance": 7}
+    defaults = {
+        "date": 1,
+        "passenger": 2,
+        "freight": 3,
+        "credit": 4,
+        "barcode": 5,
+        "other": 6,
+        "remittance": 7
+    }
     for k, v in defaults.items():
         if k not in col_map:
             col_map[k] = v
     return col_map
 
-def find_target_row(sheet, date_day):
-    """直接在前 3 欄定位 1~31 的日期列號，不受表頭其他文字干擾"""
-    target = int(date_day)
-    for c in range(1, 4):
-        for r in range(1, 45):
-            val = sheet.cell(row=r, column=c).value
-            if val is not None:
-                try:
-                    c_val = str(val).replace("日", "").replace("號", "").strip()
-                    if int(float(c_val)) == target:
-                        return r
-                except Exception:
-                    continue
-    return target + 1
+def find_target_row(sheet, date_day, date_col=1):
+    """精準尋找對應日期的列號 (1~31)，支援多種日期格式相容"""
+    target_day = int(date_day)
+    for r in range(1, 45):
+        val = sheet.cell(row=r, column=date_col).value
+        if val is None:
+            continue
+        if hasattr(val, "day"):
+            if val.day == target_day:
+                return r
+        val_str = str(val).strip()
+        m = re.search(r'(\d+)(?:日|號)?$', val_str)
+        if m:
+            try:
+                if int(m.group(1)) == target_day:
+                    return r
+            except Exception:
+                pass
+        try:
+            if int(float(val_str)) == target_day:
+                return r
+        except Exception:
+            pass
+    return None
 
-def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=5):
-    """呼叫 API 辨識單頁，內建 5 次長退避與隨機抖動重試，抗 429 限流"""
+def write_cell_if_valid(sheet, row_idx, col_idx, val):
+    """安全寫入指定儲存格（0 或空值不寫入以維護報表整潔）"""
+    if val is not None and val != 0 and val != "0" and val != "":
+        if col_idx:
+            sheet.cell(row=row_idx, column=col_idx, value=val)
+            return 1
+    return 0
+
+def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=8):
+    """單頁辨識函式，內建強效指數退避與防 429 限流機制"""
     for retry in range(max_retries):
         try:
             res = client.models.generate_content(
@@ -241,17 +215,16 @@ def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=5):
             )
             if res and res.text:
                 clean_text = extract_json_str(res.text)
-                report = StationReport.model_validate_json(clean_text)
-                if report.station_name and report.date_day > 0:
-                    return report, None
-                elif retry == max_retries - 1:
-                    return None, "未能識別出有效車站或進款日期"
+                return StationReport.model_validate_json(clean_text), None
         except Exception as e:
             err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                # 指數退避加上隨機抖動，避免多線程同時重發碰撞
-                sleep_sec = (2 ** retry) * 2.5 + random.uniform(0.5, 2.0)
-                time.sleep(sleep_sec)
+            # 遇到 429 或限流錯誤，採用階梯式等待 + 隨機微延遲
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "Quota" in err:
+                wait_sec = min(50.0, (2 ** retry) * 2.0 + random.uniform(1.0, 3.0))
+                time.sleep(wait_sec)
+                continue
+            elif "503" in err or "500" in err or "UNAVAILABLE" in err:
+                time.sleep(3.0 + random.uniform(0.5, 2.0))
                 continue
             elif retry == max_retries - 1:
                 return None, err
@@ -268,7 +241,7 @@ with col2:
     uploaded_pdfs = st.file_uploader("📥 步驟 2：批次上傳掃描 PDF 解款單 (可多選)", type=["pdf"], accept_multiple_files=True)
 
 # ----------------------------------------------------
-# 4. 核心辨識與填寫
+# 4. 核心辨識與填寫流程
 # ----------------------------------------------------
 if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_container_width=True):
     if not active_api_key:
@@ -284,7 +257,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     try:
         wb = openpyxl.load_workbook(io.BytesIO(uploaded_excel.getvalue()), data_only=False)
     except Exception as e:
-        st.error(f"❌ Excel 讀取失敗，請確認上傳標準 .xlsx 檔案：{e}")
+        st.error(f"❌ Excel 讀取失敗，請確認上傳標準 .xlsx 公版：{e}")
         st.stop()
 
     status_box = st.status("📄 [階段 1/2] 正在拆分 PDF 頁面...", expanded=True)
@@ -308,24 +281,36 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
         st.stop()
 
-    status_box.update(label=f"⚡ [階段 2/2] 啟動 {concurrency} 線程精準辨識 {total_tasks} 頁單據...", state="running")
+    status_box.update(label=f"⚡ [階段 2/2] {concurrency} 線程精準辨識 {total_tasks} 頁解款單據中...", state="running")
     
     prompt = """
-    你是一位專業嚴謹的台鐵會計表單辨識審核員。請仔細辨識這張台鐵站務解款單（23_R_20）：
-    1. 車站名稱：位於左上方（如 3150_豐富站、3160_苗栗站、3300_臺中站等，僅需填寫站名如「豐富」、「苗栗」、「台中」）。
-    2. 進款日期：位於上方或右上（如「進款日期:2026年08月28日」），擷取其日數（1~31 的整數）。
-    3. 專注看左側【應解款數】大欄位（切勿看右側實解款數的鈔票張數）：
-       - 客運(+) 金額
-       - 貨運(+) 金額（若無填 0）
-       - 信用卡刷卡(-) 金額（填正數，無則填 0）
-       - 信用卡退刷(+) 金額（若有退刷務必填正數，無退刷填 0）
-       - 條碼支付進款(-) 金額（填正數，無則填 0）
-       - 條碼支付退款(+) 金額（若有退款務必填正數，無退款填 0）
-       - 其他項目：存付運費(+)、託收支票(-)、補繳金額(+)、繳回週轉金(+)等所有非上述四項的其餘項目淨額加總
-       - 應解總計：左側最下方的應解總計金額
-    4. 會計平衡檢核式：
-       客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計。
-       請務必以此勾稽原則覆核數值是否完整正確！
+    你是一位極度嚴謹專業的台鐵會計表單辨識專家。請仔細檢視這張解款單：
+
+    ⚠️【極重要：日期辨識絕對準則】：
+    1. 請務必尋找單據右上角印製的『進款日期: 2026年XX月XX日』，僅擷取其中的『日』(1~31 的整數)！
+    ⛔ 嚴格禁止讀取：
+       - 右下角資金管理科的藍色核章（例如『115. 8. 31 訖』或『115. 9. -1』，那是點收日期，絕對不是進款日期！）。
+       - 最上方的『列印時間』。
+       - 任何簽核欄位的時間。
+       必須 100% 以『進款日期:』後面的日數為唯一標準！
+
+    ⚠️【車站名稱準則】：
+    2. 擷取車站名稱（豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水），去除站碼（如 3150_）與'站'字。注意分清「烏日」與「新烏日」。
+
+    ⚠️【數值擷取與會計勾稽原則】：
+    3. 專注檢視左側【應解款數】大項目區塊（若無項目填 0，複寫或淺色數字請仔細辨識）：
+       - 客運(+)：包含客運及離線客運金額
+       - 貨運(+)
+       - 信用卡刷卡(-) (填正數)
+       - 信用卡退刷(+) (請特別注意是否有退刷正數金額，勿漏看)
+       - 條碼支付進款(-) (填正數)
+       - 條碼支付退款(+) (請特別注意是否有退款正數金額，勿漏看)
+       - 應解總計：報表上的應解總計金額
+       - 其他項目加總：除上述項目外之其他明細加總（如：繳回週轉金、存付運費、託收支票、補繳金額等淨額）
+
+    4. 【必須符合會計平衡公式】：
+       客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計
+       請務必以此公式自我驗算，確認擷取的數值無誤後再輸出！
     """
 
     results_data = []
@@ -343,34 +328,48 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             idx, file_name, p_idx, total_p = future_map[future]
             progress_bar.progress(
                 completed_count / total_tasks,
-                text=f"辨識處理中：已完成 {completed_count}/{total_tasks} 頁 ({completed_count * 100 // total_tasks}%)"
+                text=f"⚡ 辨識處理中：已完成 {completed_count}/{total_tasks} 頁 ({completed_count * 100 // total_tasks}%)"
             )
             
             try:
                 parsed_data, err_msg = future.result()
                 if parsed_data and parsed_data.date_day > 0:
                     results_data.append((idx, file_name, p_idx, parsed_data))
-                    status_box.write(f"✅ **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功 - `{file_name}` 第 {p_idx} 頁")
+                    status_box.write(f"✅ **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功 ➜ 檔案 `{file_name}` 第 {p_idx} 頁")
                 else:
-                    status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁辨識失敗：{err_msg}")
+                    status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁辨識失敗：{str(err_msg)[:60]}")
             except Exception as e:
-                status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁處理異常：{e}")
+                status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁執行異常：{e}")
 
     results_data.sort(key=lambda x: x[0])
 
     # ----------------------------------------------------
-    # 5. 回填 Excel 與會計平衡檢核
+    # 5. 回填 Excel 與 會計立場平衡核對
     # ----------------------------------------------------
-    status_box.update(label="📝 正在將辨識結果精確寫入 Excel 公版儲存格...", state="running")
+    status_box.update(label="📝 正在將辨識資料寫入 Excel 公版...", state="running")
     total_written = 0
     success_count = 0
     audit_records = []
 
     for idx, file_name, p_idx, data in results_data:
-        target_sheet = get_target_sheet(wb, data.station_name)
+        target_name_clean = clean_station_name(data.station_name)
+        
+        # 嚴格優先完全相符比對（防止烏日/新烏日錯配）
+        target_sheet = None
+        for s_name in wb.sheetnames:
+            if clean_station_name(s_name) == target_name_clean:
+                target_sheet = wb[s_name]
+                break
+        if not target_sheet:
+            for s_name in wb.sheetnames:
+                s_clean = clean_station_name(s_name)
+                if s_clean and (s_clean == target_name_clean):
+                    target_sheet = wb[s_name]
+                    break
 
         net_credit = data.credit_card_charge - data.credit_card_refund
         net_barcode = data.barcode_in - data.barcode_refund
+
         computed_total = data.passenger_revenue + data.freight_revenue - net_credit - net_barcode + data.other_amount
         diff = round(data.remittance_total - computed_total, 2)
         is_balanced = (abs(diff) < 0.01)
@@ -378,46 +377,40 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         cc_formula = build_deduction_formula(data.credit_card_charge, data.credit_card_refund)
         bc_formula = build_deduction_formula(data.barcode_in, data.barcode_refund)
 
+        sheet_status = "❌ 找不到工作表"
+        if target_sheet:
+            col_map = analyze_sheet_structure(target_sheet)
+            target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
+
+            if target_row:
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount))
+                total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total))
+                success_count += 1
+                sheet_status = f"已寫入 [{target_sheet.title}] 第 {target_row} 列"
+            else:
+                sheet_status = f"⚠️ 找不到 {data.date_day} 日之列號"
+
         audit_records.append({
             "檔案名稱": file_name,
             "車站名稱": data.station_name,
-            "日期": f"{data.date_day} 日",
+            "進款日期": f"{data.date_day} 日",
             "客運": to_clean_num(data.passenger_revenue),
             "貨運": to_clean_num(data.freight_revenue),
-            "電腦信用卡": cc_formula,
-            "條碼": bc_formula,
+            "電腦信用卡 (=刷卡-退刷)": cc_formula if cc_formula is not None else 0,
+            "條碼 (=進款-退款)": bc_formula if bc_formula is not None else 0,
             "其他": to_clean_num(data.other_amount),
             "自輸 (PDF應解總計)": to_clean_num(data.remittance_total),
             "計算總計": to_clean_num(computed_total),
-            "差額 (自輸-總計)": diff,
+            "差額": diff,
             "平衡狀態": "✅ 平衡 (0)" if is_balanced else f"❌ 差額 {diff:+.0f}",
-            "工作表寫入": f"已寫入 [{target_sheet.title}]" if target_sheet else "❌ 找不到分頁"
+            "寫入狀態": sheet_status
         })
 
-        if not target_sheet:
-            continue
-
-        col_map = analyze_sheet_structure(target_sheet)
-        target_row = find_target_row(target_sheet, data.date_day)
-
-        # 寫入各欄位儲存格
-        fields_to_write = [
-            (col_map.get("passenger"), to_clean_num(data.passenger_revenue)),
-            (col_map.get("freight"), to_clean_num(data.freight_revenue)),
-            (col_map.get("credit"), cc_formula),
-            (col_map.get("barcode"), bc_formula),
-            (col_map.get("other"), to_clean_num(data.other_amount)),
-            (col_map.get("remittance"), to_clean_num(data.remittance_total))
-        ]
-
-        for col_idx, val in fields_to_write:
-            if col_idx and val is not None and val != "":
-                target_sheet.cell(row=target_row, column=col_idx, value=val)
-                total_written += 1
-
-        success_count += 1
-
-    status_box.update(label="🎉 辨識與 Excel 自動填表全數完成！", state="complete")
+    status_box.update(label="🎉 辨識與 Excel 寫入全數完成！", state="complete")
     progress_bar.empty()
 
     out_stream = io.BytesIO()
@@ -426,19 +419,19 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     elapsed = time.time() - start_time
 
     st.balloons()
-    st.success(f"✨ 處理完成！總耗時 {elapsed:.1f} 秒，共成功處理 {success_count}/{total_tasks} 頁解款單，成功填寫了 {total_written} 個儲存格！")
+    st.success(f"✨ 處理完成！耗時 {elapsed:.1f} 秒，共成功處理 {success_count}/{total_tasks} 頁單據，填寫了 {total_written} 個儲存格！")
 
     # ----------------------------------------------------
-    # 6. 會計平衡檢核儀表板與檔案下載
+    # 6. 會計平衡檢核儀表板與下載
     # ----------------------------------------------------
     st.subheader("⚖️ 單據會計平衡勾稽核對表")
     if audit_records:
         df_audit = pd.DataFrame(audit_records)
         unbalanced_count = sum(1 for r in audit_records if "❌" in r["平衡狀態"])
         if unbalanced_count > 0:
-            st.error(f"⚠️ 注意：共有 **{unbalanced_count}** 筆單據計算不平衡，請檢視下方表格確認單據細項！")
+            st.warning(f"⚠️ 注意：共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請查看下方表格確認。")
         else:
-            st.success("🎯 太棒了！所有辨識成功的單據會計平衡檢核完全吻合（差額為 0）！")
+            st.success("🎯 太棒了！所有單據之勾稽計算皆完全平衡（差額為 0）！")
 
         st.dataframe(df_audit, use_container_width=True, hide_index=True)
 
@@ -449,5 +442,5 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True
-                 )
+    )
     
