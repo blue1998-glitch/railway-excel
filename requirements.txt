@@ -1,7 +1,6 @@
 streamlit
-openpyxl
-pypdf
 google-genai
+openpyxl
 pandas
 pydantic
-google-generativeai
+pypdf
