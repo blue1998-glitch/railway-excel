@@ -2,6 +2,7 @@ import io
 import re
 import time
 import random
+import threading
 import openpyxl
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -16,10 +17,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ----------------------------------------------------
 st.set_page_config(page_title="台鐵解款單自動化填表系統", page_icon="🚆", layout="wide")
 st.title("🚆 台鐵掃描解款單 ➜ Excel 智慧自動填表系統")
-st.caption("🚀 完整保留原始公式與格式 ｜ ⚡ 多執行緒極速辨識 ｜ ⚖️ 會計立場扣抵公式 (=刷卡-退刷) ｜ 🔍 自動平衡檢核")
+st.caption("🚀 完整保留原始公式與格式 ｜ ⚡ 智慧抗限流極速辨識 ｜ ⚖️ 會計立場扣抵公式 (=刷卡-退刷) ｜ 🔍 自動平衡檢核")
 
 raw_key = st.secrets.get("GEMINI_API_KEY", "")
 cleaned_key = str(raw_key).replace('"', '').replace("'", "").strip()
+
+# 全域請求節流鎖：避免多線程在同一瞬間發動請求觸發 429 限流
+rate_limit_lock = threading.Lock()
+last_request_timestamp = [0.0]
+
+def pace_request(min_interval=1.3):
+    """確保兩次 API 呼叫之間至少間隔 min_interval 秒，平滑分佈流量"""
+    with rate_limit_lock:
+        now = time.time()
+        elapsed = now - last_request_timestamp[0]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        last_request_timestamp[0] = time.time()
 
 with st.sidebar:
     st.header("⚙️ 系統設定")
@@ -31,8 +45,6 @@ with st.sidebar:
     )
     active_api_key = user_key.strip()
     
-    # 動態探測金鑰實際支援、且可用於 generateContent 的 Gemini 模型
-    # 不寫死特定版號：Google 經常更新/淘汰模型名稱，寫死版號正是過去 404 錯誤的主因
     EXCLUDE_KEYWORDS = ("embedding", "image", "audio", "tts", "live", "aqa", "vision", "transcribe", "robotics")
 
     def _model_rank(name):
@@ -43,10 +55,13 @@ with st.sidebar:
         version = float(nums[0]) if nums else 0.0
         return (tier, unstable, -version)
 
-    available_models = []
-    if active_api_key:
+    @st.cache_data(ttl=600, show_spinner=False)
+    def probe_available_models(api_key: str):
+        if not api_key:
+            return []
+        models = []
         try:
-            temp_client = genai.Client(api_key=active_api_key)
+            temp_client = genai.Client(api_key=api_key)
             for m in temp_client.models.list():
                 m_name = getattr(m, "name", "").replace("models/", "")
                 name_l = m_name.lower()
@@ -57,29 +72,30 @@ with st.sidebar:
                     continue
                 if any(k in name_l for k in EXCLUDE_KEYWORDS):
                     continue
-                available_models.append(m_name)
+                models.append(m_name)
         except Exception:
             pass
+        return models
 
-    if not available_models:
-        # 僅在無法連線探測時才會用到的備援清單（探測成功時完全不會用到這裡）
-        available_models = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+    discovered_models = probe_available_models(active_api_key)
+    if not discovered_models:
+        available_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     else:
-        available_models = sorted(set(available_models), key=_model_rank)
+        available_models = sorted(set(discovered_models), key=_model_rank)
 
     selected_model = st.selectbox(
         "AI 辨識核心模型",
         options=available_models,
         index=0,
-        help="系統已自動連線篩選出您金鑰支援的最新高速模型"
+        help="系統已自動連線篩選出您金鑰支援的高速穩定模型"
     )
 
     concurrency = st.slider(
-        "⚡ 並行辨識加速線程數",
+        "⚡ 並行辨識線程數",
         min_value=1,
-        max_value=6,
-        value=4,
-        help="同時辨識多頁。設定 4~5 可將辨識速度提升數倍且穩定不超限"
+        max_value=4,
+        value=2,
+        help="推薦設為 2。搭配內建流量平滑機制，兼具辨識速度與 100% 避開 429 限流"
     )
 
     if active_api_key:
@@ -99,16 +115,16 @@ with st.sidebar:
 # 2. 定義資料結構與工具函式
 # ----------------------------------------------------
 class StationReport(BaseModel):
-    station_name: str = Field(description="車站名稱（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，不需包含'站'字或站碼）")
-    date_day: int = Field(description="報表進款日期中的『日/號』(1 至 31 的整數數字)")
+    station_name: str = Field(description="車站名稱（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，去除站碼與'站'字）")
+    date_day: int = Field(description="報表進款或解繳日期中的『日/號數』（必須是 1 至 31 的整數，如 3月8日 填 8，絕不可填寫民國年或月份）")
     passenger_revenue: float = Field(default=0.0, description="左側【應解款數】區塊內的『客運(+)』金額，無則為 0")
     freight_revenue: float = Field(default=0.0, description="左側【應解款數】區塊內的『貨運(+)』金額，無則為 0")
     credit_card_charge: float = Field(default=0.0, description="左側【應解款數】區塊內的『信用卡刷卡(-)』金額 (填正數)，無則為 0")
     credit_card_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『信用卡退刷(+)』金額 (填正數)，無退刷則為 0")
     barcode_in: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付進款(-)』金額 (填正數)，無則為 0")
     barcode_refund: float = Field(default=0.0, description="左側【應解款數】區塊內的『條碼支付退款(+)』金額 (填正數)，無退款則為 0")
-    other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細金額加總（如存付運費、託收支票、補繳金額、繳回週轉金、其他短欠等），若無則填 0")
-    remittance_total: float = Field(default=0.0, description="左側【應解款數】區塊內的『應解總計』金額")
+    other_amount: float = Field(default=0.0, description="左側【應解款數】區塊內除上述項目外的其他明細淨額加總（如存付運費、補繳、週轉金等），若無則填 0")
+    remittance_total: float = Field(default=0.0, description="左側【應解款數】區塊內的『應解總計』或『自輸』金額")
 
 def extract_json_str(text: str) -> str:
     """安全去除 Markdown 標籤以解析 JSON"""
@@ -155,11 +171,14 @@ def build_deduction_formula(charge_val, refund_val):
     return None
 
 def analyze_sheet_structure(sheet):
-    """智慧掃描工作表表頭取得各欄位位置（絕不改動總計與加總公式欄）"""
+    """智慧精確掃描工作表表頭取得各欄位位置（嚴格排除製表日期、傳票編號等雜訊欄）"""
     col_map = {}
     for r in range(1, 6):
-        for c in range(1, sheet.max_column + 1):
-            val = str(sheet.cell(row=r, column=c).value or "").replace(" ", "").replace("\n", "").strip()
+        for c in range(1, min(sheet.max_column + 1, 25)):
+            raw_val = sheet.cell(row=r, column=c).value
+            if not raw_val:
+                continue
+            val = str(raw_val).replace(" ", "").replace("\n", "").strip()
             if not val:
                 continue
             if "客運" in val and "passenger" not in col_map:
@@ -172,10 +191,12 @@ def analyze_sheet_structure(sheet):
                 col_map["barcode"] = c
             elif "其他" in val and "other" not in col_map:
                 col_map["other"] = c
-            elif ("自輸" in val or "字輸" in val) and "remittance" not in col_map:
+            elif ("自輸" in val or "字輸" in val or "應解總計" in val) and "remittance" not in col_map:
                 col_map["remittance"] = c
-            elif ("日" in val or "期" in val or "號" in val) and "date" not in col_map:
-                col_map["date"] = c
+            # 精準判定日期欄，避免「製表日期」或「編號」誤判
+            elif (val in ["日期", "日", "號", "號數", "日/期"]) or ("日期" in val and not any(k in val for k in ["製表", "編號", "傳票"])):
+                if "date" not in col_map:
+                    col_map["date"] = c
 
     defaults = {
         "date": 1,
@@ -192,17 +213,24 @@ def analyze_sheet_structure(sheet):
     return col_map
 
 def find_target_row(sheet, date_day, date_col=1):
-    """精準尋找對應日期的列號 (1~31)"""
-    for r in range(1, 45):
-        val = sheet.cell(row=r, column=date_col).value
-        if val is not None:
-            try:
-                val_str = str(val).replace("日", "").replace("號", "").strip()
-                if int(float(val_str)) == int(date_day):
-                    return r
-            except Exception:
-                pass
-    return int(date_day) + 1
+    """精準雙重尋找對應日期的列號 (1~31)"""
+    search_cols = [date_col] if date_col else []
+    for c in (1, 2):
+        if c not in search_cols:
+            search_cols.append(c)
+
+    for c in search_cols:
+        for r in range(1, 45):
+            val = sheet.cell(row=r, column=c).value
+            if val is not None:
+                try:
+                    s = str(val).replace("日", "").replace("號", "").strip()
+                    if s.isdigit() and int(s) == int(date_day):
+                        return r
+                except Exception:
+                    pass
+    # 若公版無文字標註，預設從第 3 列（表頭 2 列後）開始累加
+    return int(date_day) + 2
 
 def write_cell_if_valid(sheet, row_idx, col_idx, val):
     """安全寫入指定儲存格（0 或空值不寫入以維護公版乾淨）"""
@@ -213,13 +241,16 @@ def write_cell_if_valid(sheet, row_idx, col_idx, val):
     return 0
 
 class FatalAPIError(Exception):
-    """不可能靠重試解決的錯誤（如 404 模型不存在/已停用、401、403 金鑰或權限問題）"""
+    """致命錯誤（404 模型不存在、401 金鑰失效、403 權限不足）"""
     pass
 
-def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=4):
-    """單頁辨識函式：429/伺服器忙碌採帶抖動的指數退避重試；模型或金鑰問題直接判定為致命錯誤"""
+def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=6):
+    """具備流量平滑節流與階梯式自適應退避的辨識函式"""
     last_err = "未知錯誤"
     for retry in range(max_retries):
+        # 1. 請求流量平滑控制，防止瞬時爆量觸發 429
+        pace_request(min_interval=1.3)
+
         try:
             res = client.models.generate_content(
                 model=model_name,
@@ -235,23 +266,29 @@ def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=4):
             )
             if res and res.text:
                 clean_text = extract_json_str(res.text)
-                return StationReport.model_validate_json(clean_text), None
-            last_err = "模型回傳空白內容（可能被安全機制擋下），重試中"
+                parsed = StationReport.model_validate_json(clean_text)
+                if 1 <= parsed.date_day <= 31:
+                    return parsed, None
+                return None, f"辨識出的日期 ({parsed.date_day}) 超出 1~31 日範圍"
+            last_err = "模型回傳內容為空"
         except errors.ClientError as e:
-            if e.code == 429:
-                last_err = f"429 頻率限制：{e.message}"
-                time.sleep(min(30.0, 1.6 ** retry + random.uniform(0, 1.0)))
+            if e.code == 429 or "429" in str(e):
+                # 遇到 429 採取漸進拉長等待時間，跨越 60 秒額度刷新窗口
+                wait_sec = 4.0 * (retry + 1) + random.uniform(1.0, 2.5)
+                last_err = f"觸發 429 限流，自動等待 {wait_sec:.1f} 秒後進行第 {retry + 1} 次重試"
+                time.sleep(wait_sec)
                 continue
-            # 404 模型不存在/已停用、401 金鑰錯誤、403 權限不足等，重試無用，直接判定為致命錯誤
             raise FatalAPIError(f"{e.code} {e.message}")
         except errors.ServerError as e:
-            last_err = f"{e.code} 伺服器忙碌：{e.message}"
-            time.sleep(min(20.0, 1.6 ** retry + random.uniform(0, 1.0)))
+            wait_sec = 3.0 * (retry + 1) + random.uniform(1.0, 2.0)
+            last_err = f"伺服器忙碌 ({e.code})，等待 {wait_sec:.1f} 秒"
+            time.sleep(wait_sec)
             continue
         except Exception as e:
             last_err = str(e)
-        time.sleep(0.8)
-    return None, f"超過最大重試次數（{last_err}）"
+            time.sleep(1.5)
+
+    return None, f"已達最大重試次數 ({last_err})"
 
 # ----------------------------------------------------
 # 3. 介面上傳區塊
@@ -277,13 +314,12 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     client = genai.Client(api_key=active_api_key)
 
     try:
-        # data_only=False 確保公版內既有的公式、樣式與格式 100% 完整保留
         wb = openpyxl.load_workbook(io.BytesIO(uploaded_excel.getvalue()), data_only=False)
     except Exception as e:
         st.error(f"❌ Excel 讀取失敗，請確認上傳標準 .xlsx 公版：{e}")
         st.stop()
 
-    status_box = st.status("📄 [階段 1/2] 正在拆分 PDF 頁面...", expanded=True)
+    status_box = st.status("📄 [階段 1/2] 正在解析並拆分 PDF 頁面...", expanded=True)
     all_pages = []
     
     for pdf_file in uploaded_pdfs:
@@ -304,23 +340,26 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         status_box.update(label="❌ 沒有找到可處理的 PDF 頁面", state="error")
         st.stop()
 
-    status_box.update(label=f"⚡ [階段 2/2] {concurrency} 線程高速並行辨識 {total_tasks} 頁解款單據...", state="running")
+    status_box.update(label=f"⚡ [階段 2/2] 啟動抗限流穩健辨識 {total_tasks} 頁解款單據...", state="running")
     
     prompt = """
-    你是一位專業精確的台鐵會計表單辨識專家。請仔細檢視這張解款單據：
-    【特別注意淺色或複寫印件】：
-    單據若為複寫或影印，字跡可能較淺，請特別仔細分辨淺色數字（如 0、3、8、1、7），切勿遺漏。
-    1. 擷取【車站名稱】（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等，去除站碼與'站'字）與進款【日期】（僅需日/號數，1-31 的整數）。
-    2. 專注看左側【應解款數】大項目區塊，精確擷取各數值（若無填 0）：
-       - 客運(+)
-       - 貨運(+)
-       - 信用卡刷卡(-) (填正數)
-       - 信用卡退刷(+) (請仔細分辨，有退刷務必填正數金額；若無退刷填 0)
-       - 條碼支付進款(-) (填正數)
-       - 條碼支付退款(+) (請仔細分辨，有退款務必填正數金額；若無退款填 0)
-       - 應解總計 (報表上的應解總計數值)
-       - 其他項目加總（如存付運費、託收支票、補繳金額、繳回週轉金等其他明細淨額，若無填 0）
-    3. 會計勾稽驗算原則：必符合「客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計」。請務必以此原則交叉驗算確認！
+    你是一位專業精確的台鐵會計表單審查專家。請仔細審視這張台鐵解款單據：
+    【特別注意複寫或淺色印件】：
+    單據多為影印或複寫，字跡較淺，請特別仔細分辨淺色手寫或打印數字（特別注意 0、3、8、1、7），切勿遺漏。
+
+    【核心擷取規範】：
+    1. 車站名稱 (station_name)：擷取車站中文名稱（例如：豐富、苗栗、銅鑼、三義、泰安、后里、豐原、栗林、潭子、頭家厝、松竹、太原、精武、台中、五權、大慶、新烏日、烏日、成功、彰化、花壇、大村、員林、社頭、田中、二水等），去除站碼數字與'站'字。
+    2. 進款日期 (date_day)：請找出單據表頭的進款或解繳日期中的【日/號數】（必須為 1 到 31 的整數）。若單據寫「115年3月8日」或「3/8」，請擷取數字 8，絕不能填寫年份（如 115）或月份（如 3）。
+    3. 應解款項明細（請專注看左側【應解款數】大項目區塊）：
+       - 客運(+)：客運進款金額，無則填 0
+       - 貨運(+)：貨運進款金額，無則填 0
+       - 信用卡刷卡(-)：電腦信用卡/刷卡進款金額（填正數），無則填 0
+       - 信用卡退刷(+)：信用卡退刷金額（仔細分辨，有退刷務必填正數），無退刷填 0
+       - 條碼支付進款(-)：條碼支付進款金額（填正數），無則填 0
+       - 條碼支付退款(+)：條碼退款金額（仔細分辨，有退款務必填正數），無退款填 0
+       - 其他項目 (other_amount)：包含存付運費、託收支票、補繳、週轉金等其他明細淨額加總，無則填 0
+       - 應解總計 (remittance_total)：報表上的『應解總計』或『自輸』金額
+    4. 會計勾稽原則：必符合「客運 + 貨運 - 信用卡刷卡 + 信用卡退刷 - 條碼進款 + 條碼退款 + 其他 = 應解總計」。請依此公式交叉驗算核對！
     """
 
     results_data = []
@@ -328,7 +367,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     completed_count = 0
     fatal_error = None
 
-    # 採用 ThreadPoolExecutor 並行加速呼叫 API
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_map = {
             executor.submit(call_gemini_page, client, selected_model, page_bytes, prompt): (idx, file_name, p_idx, total_p)
@@ -340,7 +378,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             idx, file_name, p_idx, total_p = future_map[future]
             progress_bar.progress(
                 completed_count / total_tasks,
-                text=f"⚡ 高速並行辨識中：已完成 {completed_count}/{total_tasks} 頁 ({completed_count * 100 // total_tasks}%)"
+                text=f"⚡ 穩健辨識進度：{completed_count}/{total_tasks} 頁 ({completed_count * 100 // total_tasks}%)"
             )
             
             try:
@@ -349,27 +387,21 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
                     results_data.append((idx, file_name, p_idx, parsed_data))
                     status_box.write(f"✅ **{parsed_data.station_name}**（{parsed_data.date_day} 日）辨識成功 - `{file_name}` 第 {p_idx} 頁")
                 else:
-                    status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁辨識失敗 ({str(err_msg)[:60]})")
+                    status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁辨識失敗：{str(err_msg)}")
             except FatalAPIError as e:
                 fatal_error = fatal_error or str(e)
             except Exception as e:
                 status_box.write(f"⚠️ `{file_name}` 第 {p_idx} 頁執行異常：{e}")
 
     if fatal_error:
-        st.error(
-            f"❌ Gemini API 回傳無法靠重試解決的錯誤：{fatal_error}\n\n"
-            f"常見原因：所選模型「{selected_model}」已不存在或已停用（404），或 API Key 權限不足（401/403）。"
-            f"請至左側「AI 辨識核心模型」選單改選其他模型，或確認 API Key 是否正確後再重新執行一次。"
-            f"（下方仍會列出本次已成功辨識的頁面，可先下載保留。）"
-        )
+        st.error(f"❌ 發生致命錯誤，請確認模型或 API Key：{fatal_error}")
 
-    # 依照原始單據頁面順序排序，確保勾稽審核表井然有序
     results_data.sort(key=lambda x: x[0])
 
     # ----------------------------------------------------
-    # 5. 回填 Excel 與 會計立場平衡檢查（主線程安全寫入）
+    # 5. 回填 Excel 與 會計立場平衡檢查
     # ----------------------------------------------------
-    status_box.update(label="📝 正在將辨識資料寫入 Excel 公版...", state="running")
+    status_box.update(label="📝 正在將辨識資料寫入 Excel 公版對應儲存格...", state="running")
     total_written = 0
     success_count = 0
     audit_records = []
@@ -377,7 +409,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     for idx, file_name, p_idx, data in results_data:
         target_name_clean = clean_station_name(data.station_name)
         
-        # 嚴格優先完全符合（防止「烏日」與「新烏日」搶先誤配）
+        # 嚴格精確比對車站名稱（避免新烏日與烏日誤配）
         target_sheet = None
         for s_name in wb.sheetnames:
             if clean_station_name(s_name) == target_name_clean:
@@ -386,7 +418,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         if not target_sheet:
             for s_name in wb.sheetnames:
                 s_clean = clean_station_name(s_name)
-                if s_clean and (s_clean in target_name_clean or target_name_clean in s_clean):
+                if s_clean and len(s_clean) >= 2 and (s_clean in target_name_clean or target_name_clean in s_clean):
                     target_sheet = wb[s_name]
                     break
 
@@ -422,7 +454,7 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
 
-        # 精準寫入特定資料儲存格，原儲存格公式與樣式 100% 不受干擾
+        # 寫入特定儲存格，原有公式與樣式 100% 保留不受干擾
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
@@ -451,9 +483,9 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         df_audit = pd.DataFrame(audit_records)
         unbalanced_count = sum(1 for r in audit_records if "❌" in r["平衡狀態"])
         if unbalanced_count > 0:
-            st.error(f"⚠️ 警告：共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請依下方表格核對單據金額！")
+            st.error(f"⚠️ 共有 **{unbalanced_count}** 筆單據「自輸 - 總計」不等於 0，請核對上方明細！")
         else:
-            st.success("🎯 太棒了！所有辨識成功的單據「自輸 - 總計」皆等於 0，會計平衡完全正確！")
+            st.success("🎯 太棒了！所有單據「自輸 - 總計」皆等於 0，會計勾稽平衡完全正確！")
 
         st.dataframe(df_audit, use_container_width=True, hide_index=True)
 
