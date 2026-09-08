@@ -3,4 +3,4 @@ google-genai
 openpyxl
 pandas
 pydantic
-PyMuPDF
+pypdf
