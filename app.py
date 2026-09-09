@@ -30,48 +30,28 @@ with st.sidebar:
         help="系統會優先讀取 secrets 中的 GEMINI_API_KEY"
     )
     active_api_key = user_key.strip()
-    
-    # 動態探測金鑰實際支援、且可用於 generateContent 的 Gemini 模型
-    # 不寫死特定版號：Google 經常更新/淘汰模型名稱，寫死版號正是過去 404 錯誤的主因
-    EXCLUDE_KEYWORDS = ("embedding", "image", "audio", "tts", "live", "aqa", "vision", "transcribe", "robotics")
 
-    def _model_rank(name):
-        n = name.lower()
-        tier = 0 if ("flash" in n and "lite" not in n) else (1 if "flash" in n else (2 if "pro" in n else 3))
-        unstable = 1 if ("preview" in n or "exp" in n) else 0
-        nums = re.findall(r'\d+(?:\.\d+)?', n)
-        version = float(nums[0]) if nums else 0.0
-        return (tier, unstable, -version)
-
-    available_models = []
-    if active_api_key:
-        try:
-            temp_client = genai.Client(api_key=active_api_key)
-            for m in temp_client.models.list():
-                m_name = getattr(m, "name", "").replace("models/", "")
-                name_l = m_name.lower()
-                actions = getattr(m, "supported_actions", None)
-                if "gemini" not in name_l:
-                    continue
-                if actions and "generateContent" not in actions:
-                    continue
-                if any(k in name_l for k in EXCLUDE_KEYWORDS):
-                    continue
-                available_models.append(m_name)
-        except Exception:
-            pass
-
-    if not available_models:
-        # 僅在無法連線探測時才會用到的備援清單（探測成功時完全不會用到這裡）
-        available_models = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
-    else:
-        available_models = sorted(set(available_models), key=_model_rank)
+    # 白名單機制（取代舊版 models.list 動態撈取）：
+    # 動態撈取雖然自動化，但會連同「已棄用、需額外權限申請、或不支援 PDF+結構化 JSON」的型號一併列出，
+    # 這正是過去出現 404 / 401 / 403 的主因。以下僅列出官方目前明確支援
+    # 「多模態 PDF 辨識 + 結構化 JSON 輸出」且屬穩定版（非 preview/experimental）的 Flash / Flash-Lite
+    # 主流模型，優先選用免費額度 RPM 較高的機型。日後 Google 更新模型時，只需增減下方字串即可，
+    # 不必更動其他程式邏輯。
+    MODEL_WHITELIST = [
+        "gemini-3.6-flash",           # 已實測穩定可用
+        "gemini-flash-lite-latest",   # 已實測穩定可用（官方別名，恆指向最新穩定版 Flash-Lite）
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.7-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
 
     selected_model = st.selectbox(
         "AI 辨識核心模型",
-        options=available_models,
+        options=MODEL_WHITELIST,
         index=0,
-        help="系統已自動連線篩選出您金鑰支援的最新高速模型"
+        help="白名單僅列出官方目前穩定支援 PDF 辨識＋結構化 JSON 輸出的高速模型，避免選到已棄用或需額外權限的型號"
     )
 
     concurrency = st.slider(
@@ -79,7 +59,7 @@ with st.sidebar:
         min_value=1,
         max_value=6,
         value=4,
-        help="同時辨識多頁。設定 4~5 可將辨識速度提升數倍且穩定不超限"
+        help="同時辨識多頁。設定 4~5 可將辨識速度提升數倍；若頻繁遇到 429 頻率限制，建議調低或改用 1"
     )
 
     if active_api_key:
@@ -216,8 +196,16 @@ class FatalAPIError(Exception):
     """不可能靠重試解決的錯誤（如 404 模型不存在/已停用、401、403 金鑰或權限問題）"""
     pass
 
-def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=4):
-    """單頁辨識函式：429/伺服器忙碌採帶抖動的指數退避重試；模型或金鑰問題直接判定為致命錯誤"""
+def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=5, pre_call_cooldown=0.0):
+    """單頁辨識函式
+    - pre_call_cooldown：呼叫前先冷卻等待。單線程模式下用來讓每頁請求彼此保持間隔，降低瞬間連續打點觸發 429 的機率
+    - 429 頻率限制：較長的指數退避（8s→16s→32s→60s，之後固定 60s 封頂），確保額度視窗有足夠時間重置
+    - 503 伺服器忙碌：一般指數退避（2s→4s→8s→16s→25s封頂），通常短暫即恢復，不需等太久
+    - 模型或金鑰問題（404 已停用/不存在、401/403 權限不足）：重試無用，直接判定為致命錯誤
+    """
+    if pre_call_cooldown > 0:
+        time.sleep(pre_call_cooldown)
+
     last_err = "未知錯誤"
     for retry in range(max_retries):
         try:
@@ -240,13 +228,13 @@ def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=4):
         except errors.ClientError as e:
             if e.code == 429:
                 last_err = f"429 頻率限制：{e.message}"
-                time.sleep(min(30.0, 1.6 ** retry + random.uniform(0, 1.0)))
+                time.sleep(min(60.0, 8.0 * (2 ** retry) + random.uniform(0, 2.0)))
                 continue
             # 404 模型不存在/已停用、401 金鑰錯誤、403 權限不足等，重試無用，直接判定為致命錯誤
             raise FatalAPIError(f"{e.code} {e.message}")
         except errors.ServerError as e:
             last_err = f"{e.code} 伺服器忙碌：{e.message}"
-            time.sleep(min(20.0, 1.6 ** retry + random.uniform(0, 1.0)))
+            time.sleep(min(25.0, 2.0 ** (retry + 1) + random.uniform(0, 1.5)))
             continue
         except Exception as e:
             last_err = str(e)
@@ -328,10 +316,17 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     completed_count = 0
     fatal_error = None
 
+    # 單線程模式下，每頁請求之間加入固定冷卻秒數，避免瞬間連續打點觸發 429；
+    # 多線程模式下請求時間點已因並行而自然分散，故不額外節流，以維持產出效率
+    per_page_cooldown = 2.0 if concurrency == 1 else 0.0
+
     # 採用 ThreadPoolExecutor 並行加速呼叫 API
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_map = {
-            executor.submit(call_gemini_page, client, selected_model, page_bytes, prompt): (idx, file_name, p_idx, total_p)
+            executor.submit(
+                call_gemini_page, client, selected_model, page_bytes, prompt,
+                pre_call_cooldown=per_page_cooldown
+            ): (idx, file_name, p_idx, total_p)
             for idx, (file_name, p_idx, total_p, page_bytes) in enumerate(all_pages, 1)
         }
 
