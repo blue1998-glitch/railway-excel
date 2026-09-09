@@ -32,11 +32,6 @@ with st.sidebar:
     active_api_key = user_key.strip()
 
     # 白名單機制（取代舊版 models.list 動態撈取）：
-    # 動態撈取雖然自動化，但會連同「已棄用、需額外權限申請、或不支援 PDF+結構化 JSON」的型號一併列出，
-    # 這正是過去出現 404 / 401 / 403 的主因。以下僅列出官方目前明確支援
-    # 「多模態 PDF 辨識 + 結構化 JSON 輸出」且屬穩定版（非 preview/experimental）的 Flash / Flash-Lite
-    # 主流模型，優先選用免費額度 RPM 較高的機型。日後 Google 更新模型時，只需增減下方字串即可，
-    # 不必更動其他程式邏輯。
     MODEL_WHITELIST = [
         "gemini-3.6-flash",           # 已實測穩定可用
         "gemini-flash-lite-latest",   # 已實測穩定可用（官方別名，恆指向最新穩定版 Flash-Lite）
@@ -197,12 +192,7 @@ class FatalAPIError(Exception):
     pass
 
 def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=5, pre_call_cooldown=0.0):
-    """單頁辨識函式
-    - pre_call_cooldown：呼叫前先冷卻等待。單線程模式下用來讓每頁請求彼此保持間隔，降低瞬間連續打點觸發 429 的機率
-    - 429 頻率限制：較長的指數退避（8s→16s→32s→60s，之後固定 60s 封頂），確保額度視窗有足夠時間重置
-    - 503 伺服器忙碌：一般指數退避（2s→4s→8s→16s→25s封頂），通常短暫即恢復，不需等太久
-    - 模型或金鑰問題（404 已停用/不存在、401/403 權限不足）：重試無用，直接判定為致命錯誤
-    """
+    """單頁辨識函式"""
     if pre_call_cooldown > 0:
         time.sleep(pre_call_cooldown)
 
@@ -230,7 +220,6 @@ def call_gemini_page(client, model_name, page_bytes, prompt, max_retries=5, pre_
                 last_err = f"429 頻率限制：{e.message}"
                 time.sleep(min(60.0, 8.0 * (2 ** retry) + random.uniform(0, 2.0)))
                 continue
-            # 404 模型不存在/已停用、401 金鑰錯誤、403 權限不足等，重試無用，直接判定為致命錯誤
             raise FatalAPIError(f"{e.code} {e.message}")
         except errors.ServerError as e:
             last_err = f"{e.code} 伺服器忙碌：{e.message}"
@@ -265,7 +254,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     client = genai.Client(api_key=active_api_key)
 
     try:
-        # data_only=False 確保公版內既有的公式、樣式與格式 100% 完整保留
         wb = openpyxl.load_workbook(io.BytesIO(uploaded_excel.getvalue()), data_only=False)
     except Exception as e:
         st.error(f"❌ Excel 讀取失敗，請確認上傳標準 .xlsx 公版：{e}")
@@ -316,11 +304,8 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     completed_count = 0
     fatal_error = None
 
-    # 單線程模式下，每頁請求之間加入固定冷卻秒數，避免瞬間連續打點觸發 429；
-    # 多線程模式下請求時間點已因並行而自然分散，故不額外節流，以維持產出效率
     per_page_cooldown = 2.0 if concurrency == 1 else 0.0
 
-    # 採用 ThreadPoolExecutor 並行加速呼叫 API
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_map = {
             executor.submit(
@@ -358,7 +343,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
             f"（下方仍會列出本次已成功辨識的頁面，可先下載保留。）"
         )
 
-    # 依照原始單據頁面順序排序，確保勾稽審核表井然有序
     results_data.sort(key=lambda x: x[0])
 
     # ----------------------------------------------------
@@ -372,7 +356,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
     for idx, file_name, p_idx, data in results_data:
         target_name_clean = clean_station_name(data.station_name)
         
-        # 嚴格優先完全符合（防止「烏日」與「新烏日」搶先誤配）
         target_sheet = None
         for s_name in wb.sheetnames:
             if clean_station_name(s_name) == target_name_clean:
@@ -417,7 +400,6 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
 
-        # 精準寫入特定資料儲存格，原儲存格公式與樣式 100% 不受干擾
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
         total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
@@ -460,3 +442,67 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
         type="primary",
         use_container_width=True
     )
+
+# ----------------------------------------------------
+# 7. 擴充功能：多份已產出 Excel 報表智慧合併工具
+# ----------------------------------------------------
+st.markdown("---")
+with st.expander("🧩 獨立工具：將多個產出的 Excel 報表合併為一版", expanded=False):
+    st.markdown("""
+    * **用途**：若您分多次辨識、或有不同月份/批次的 Excel 報表，可在此一次全部合併成單一總表。
+    * **安全保證**：以**第一份檔案**為基底公版，僅將後續各檔案中**有填寫的數字與公式**原樣填入正確的車站分頁與日期儲存格，**既有格式、公式與工作表絕不破壞**。
+    """)
+
+    multi_excel_files = st.file_uploader(
+        "📥 請選擇多個要合併的 Excel 報表 (.xlsx)（可按住 Ctrl 或 Shift 多選）",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="multi_excel_merger"
+    )
+
+    if st.button("🔀 開始自動合併多份報表", use_container_width=True):
+        if not multi_excel_files or len(multi_excel_files) < 2:
+            st.warning("⚠️ 請至少選取 2 個 Excel 檔案才能進行合併！")
+        else:
+            merge_status = st.status("📑 正在整併各報表資料...", expanded=True)
+            try:
+                # 以第一份檔案為基準底稿
+                base_file = multi_excel_files[0]
+                wb_merged = openpyxl.load_workbook(io.BytesIO(base_file.getvalue()), data_only=False)
+                merge_status.write(f"📘 基準底稿載入：`{base_file.name}`")
+
+                total_transferred = 0
+                for incoming_file in multi_excel_files[1:]:
+                    wb_inc = openpyxl.load_workbook(io.BytesIO(incoming_file.getvalue()), data_only=False)
+                    incoming_count = 0
+
+                    for s_name in wb_inc.sheetnames:
+                        if s_name not in wb_merged.sheetnames:
+                            continue
+                        
+                        ws_src = wb_inc[s_name]
+                        ws_dest = wb_merged[s_name]
+
+                        for r in range(1, ws_src.max_row + 1):
+                            for c in range(1, ws_src.max_column + 1):
+                                src_val = ws_src.cell(row=r, column=c).value
+                                # 僅搬移有內容且非空的儲存格，且不覆蓋相同值
+                                if src_val is not None and str(src_val).strip() != "":
+                                    dest_val = ws_dest.cell(row=r, column=c).value
+                                    if dest_val != src_val:
+                                        ws_dest.cell(row=r, column=c, value=src_val)
+                                        incoming_count += 1
+
+                    merge_status.write(f"➕ 已合併 `{incoming_file.name}`：同步填入 {incoming_count} 個儲存格")
+                    total_transferred += incoming_count
+
+                out_merged_stream = io.BytesIO()
+                wb_merged.save(out_merged_stream)
+                out_merged_stream.seek(0)
+
+                merge_status.update(label="🎉 多份報表合併完成！", state="complete")
+                st.success(f"✨ 成功整併 {len(multi_excel_files)} 份報表，共更新填寫了 {total_transferred} 個儲存格資料！")
+
+                st.download_button(
+                    label="📥 下載合併後的單一完整報表 (.xlsx)",
+             
