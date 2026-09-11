@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types, errors
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
+import copy
 
 # ----------------------------------------------------
 # 1. 網頁基本設定與金鑰讀取
@@ -41,6 +42,7 @@ with st.sidebar:
     MODEL_WHITELIST = [
         "gemini-3.6-flash",           # 已實測穩定可用
         "gemini-flash-lite-latest",   # 已實測穩定可用（官方別名，恆指向最新穩定版 Flash-Lite）
+        "gemini-flash-latest",        # 新增：官方別名，恆指向最新穩定版 Flash（尚待實測）
         "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
         "gemini-3.7-flash",
@@ -185,11 +187,32 @@ def find_target_row(sheet, date_day, date_col=1):
                 pass
     return int(date_day) + 1
 
-def write_cell_if_valid(sheet, row_idx, col_idx, val):
-    """安全寫入指定儲存格（0 或空值不寫入以維護公版乾淨）"""
+def get_column_reference_style(sheet, col_idx, ref_row=33):
+    """公版中「尚未填寫」的資料儲存格通常沒有明確樣式(僅預設細明體/未加粗)，
+    但第33列(月合計列)同一欄位是公式、必定已有公版設計的正確樣式(字型/對齊/框線/數字格式)。
+    取這裡當樣式範本，讓辨識後填入的儲存格外觀與公版一致，不再變成預設樣式"""
+    if not col_idx:
+        return None
+    ref_cell = sheet.cell(row=ref_row, column=col_idx)
+    return ref_cell if ref_cell.has_style else None
+
+def apply_style_ref(cell, style_ref):
+    """將 style_ref 儲存格的樣式套用到 cell，style_ref 為 None 時不做任何事"""
+    if style_ref is None:
+        return
+    cell.font = copy.copy(style_ref.font)
+    cell.border = copy.copy(style_ref.border)
+    cell.alignment = copy.copy(style_ref.alignment)
+    cell.fill = copy.copy(style_ref.fill)
+    cell.number_format = style_ref.number_format
+
+def write_cell_if_valid(sheet, row_idx, col_idx, val, style_ref=None):
+    """安全寫入指定儲存格（0 或空值不寫入以維護公版乾淨）；
+    若提供 style_ref，會同步套用該樣式，確保新填入的資料格外觀與公版設計一致"""
     if val is not None and val != 0 and val != "0" and val != "":
         if col_idx:
-            sheet.cell(row=row_idx, column=col_idx, value=val)
+            cell = sheet.cell(row=row_idx, column=col_idx, value=val)
+            apply_style_ref(cell, style_ref)
             return 1
     return 0
 
@@ -441,14 +464,15 @@ if st.button("🚀 開始智慧辨識與自動填表", type="primary", use_conta
 
         col_map = analyze_sheet_structure(target_sheet)
         target_row = find_target_row(target_sheet, data.date_day, col_map["date"])
+        style_refs = {k: get_column_reference_style(target_sheet, v) for k, v in col_map.items()}
 
-        # 精準寫入特定資料儲存格，原儲存格公式與樣式 100% 不受干擾
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue))
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue))
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula)
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula)
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount))
-        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total))
+        # 精準寫入特定資料儲存格，原儲存格公式 100% 不受干擾；樣式則比照公版第33列同欄位設計
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("passenger"), to_clean_num(data.passenger_revenue), style_refs.get("passenger"))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("freight"), to_clean_num(data.freight_revenue), style_refs.get("freight"))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("credit"), cc_formula, style_refs.get("credit"))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("barcode"), bc_formula, style_refs.get("barcode"))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("other"), to_clean_num(data.other_amount), style_refs.get("other"))
+        total_written += write_cell_if_valid(target_sheet, target_row, col_map.get("remittance"), to_clean_num(data.remittance_total), style_refs.get("remittance"))
 
         success_count += 1
 
@@ -511,34 +535,42 @@ if "ocr_result" in st.session_state:
         st.session_state["ocr_trigger_auto_download"] = False
 
 # ----------------------------------------------------
-# 7. 多檔案 Excel 合併工具（全新獨立功能，與上方辨識流程完全分開，不共用任何變數）
+# 7. 公版資料搬移工具（步驟化：一、指定公版；二、上傳來源檔案搬移資料）
+#    與上方辨識流程完全獨立、不共用任何變數
 # ----------------------------------------------------
 st.markdown("---")
-st.header("🔗 多檔案 Excel 合併工具")
-st.caption("將多個「已產出」的 Excel 報表（同一份公版填寫結果）合併為一份：公式與既有資料 100% 原樣保留，只會自動補齊各檔案間互補的空白儲存格")
+st.header("🔗 公版資料搬移工具")
+st.caption("步驟一指定公版（結構與公式以此為準）；步驟二上傳要搬移資料過去的檔案。只會填入公版「原本不是公式」的儲存格，公版既有公式 100% 不受影響，填入的儲存格並會比照公版樣式")
 
-merge_files = st.file_uploader(
-    "📥 上傳 2 個以上「已產出」的 Excel 報表 (.xlsx)",
+st.markdown("**步驟一：指定公版檔案**")
+template_file = st.file_uploader("📋 上傳公版 Excel (.xlsx)", type=["xlsx"], key="merge_template_uploader")
+
+st.markdown("**步驟二：上傳要搬移資料的檔案**")
+source_files = st.file_uploader(
+    "📥 上傳 1 個以上要搬移資料過去的 Excel (.xlsx)",
     type=["xlsx"],
     accept_multiple_files=True,
-    key="merge_uploader"
+    key="merge_source_uploader"
 )
 
-if st.button("🔗 開始合併 Excel", type="primary", use_container_width=True, key="merge_btn"):
-    if not merge_files or len(merge_files) < 2:
-        st.error("❌ 請至少上傳 2 個 Excel 檔案才能進行合併！")
+if st.button("🔗 開始搬移資料", type="primary", use_container_width=True, key="merge_btn"):
+    if not template_file:
+        st.error("❌ 請先於步驟一上傳公版檔案！")
+        st.stop()
+    if not source_files:
+        st.error("❌ 請於步驟二至少上傳 1 個要搬移資料的檔案！")
         st.stop()
 
     try:
-        base_wb = openpyxl.load_workbook(io.BytesIO(merge_files[0].getvalue()), data_only=False)
+        base_wb = openpyxl.load_workbook(io.BytesIO(template_file.getvalue()), data_only=False)
     except Exception as e:
-        st.error(f"❌ 第一個檔案讀取失敗，請確認為正確的 .xlsx 檔案：{e}")
+        st.error(f"❌ 公版檔案讀取失敗，請確認為正確的 .xlsx 檔案：{e}")
         st.stop()
 
     merge_log = []
     conflict_log = []
 
-    for f in merge_files[1:]:
+    for f in source_files:
         try:
             src_wb = openpyxl.load_workbook(io.BytesIO(f.getvalue()), data_only=False)
         except Exception as e:
@@ -555,24 +587,29 @@ if st.button("🔗 開始合併 Excel", type="primary", use_container_width=True
 
             for r in range(1, max_r + 1):
                 for c in range(1, max_c + 1):
+                    base_cell = base_sheet.cell(row=r, column=c)
+                    base_val = base_cell.value
+                    # 規則：公版原本就是公式的儲存格，一律跳過、絕不覆蓋
+                    if isinstance(base_val, str) and base_val.startswith("="):
+                        continue
                     src_val = src_sheet.cell(row=r, column=c).value
                     if src_val is None or src_val == "" or src_val == 0:
                         continue
-                    base_cell = base_sheet.cell(row=r, column=c)
-                    base_val = base_cell.value
                     if base_val is None or base_val == "" or base_val == 0:
                         try:
                             base_cell.value = src_val
                         except AttributeError:
                             continue
+                        # 比照公版第33列同欄位樣式，避免搬入後外觀與公版不一致
+                        apply_style_ref(base_cell, get_column_reference_style(base_sheet, c))
                         merge_log.append({
                             "來源檔案": f.name, "工作表": sheet_name,
-                            "儲存格": base_cell.coordinate, "補入內容": src_val
+                            "儲存格": base_cell.coordinate, "搬入內容": src_val
                         })
                     elif base_val != src_val:
                         conflict_log.append({
                             "工作表": sheet_name, "儲存格": base_cell.coordinate,
-                            "基準檔案值": base_val, "衝突檔案": f.name, "衝突值": src_val
+                            "公版原值": base_val, "來源檔案": f.name, "來源值": src_val
                         })
 
     merged_stream = io.BytesIO()
@@ -582,7 +619,7 @@ if st.button("🔗 開始合併 Excel", type="primary", use_container_width=True
         "excel_bytes": merged_stream.getvalue(),
         "merge_log": merge_log,
         "conflict_log": conflict_log,
-        "file_count": len(merge_files),
+        "file_count": len(source_files),
     }
     st.session_state["merge_result_is_new"] = True
     st.session_state["merge_trigger_auto_download"] = True
@@ -594,22 +631,22 @@ if "merge_result" in st.session_state:
         st.balloons()
         st.session_state["merge_result_is_new"] = False
 
-    st.success(f"✨ 合併完成！共合併 {mres['file_count']} 個檔案，補入 {len(mres['merge_log'])} 個儲存格！")
+    st.success(f"✨ 搬移完成！共處理 {mres['file_count']} 個來源檔案，填入 {len(mres['merge_log'])} 個儲存格！")
 
     if mres["conflict_log"]:
-        st.error(f"⚠️ 發現 {len(mres['conflict_log'])} 處儲存格在不同檔案中數值不同（已保留基準檔案原值、未覆蓋），請人工核對：")
+        st.error(f"⚠️ 發現 {len(mres['conflict_log'])} 處公版已有資料、但與來源檔案數值不同（已保留公版原值、未覆蓋），請人工核對：")
         st.dataframe(pd.DataFrame(mres["conflict_log"]), use_container_width=True, hide_index=True)
 
-    with st.expander(f"📋 查看本次補入明細（共 {len(mres['merge_log'])} 筆）"):
+    with st.expander(f"📋 查看本次搬入明細（共 {len(mres['merge_log'])} 筆）"):
         if mres["merge_log"]:
             st.dataframe(pd.DataFrame(mres["merge_log"]), use_container_width=True, hide_index=True)
         else:
-            st.caption("本次合併沒有新增任何補入的儲存格")
+            st.caption("本次沒有新增任何搬入的儲存格")
 
     st.download_button(
-        label="📥 點擊下載合併完成的 Excel 報表 (.xlsx)",
+        label="📥 點擊下載搬移完成的 Excel 報表 (.xlsx)",
         data=mres["excel_bytes"],
-        file_name="台鐵解款單_多檔合併完成表.xlsx",
+        file_name="台鐵解款單_資料搬移完成表.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
@@ -617,5 +654,5 @@ if "merge_result" in st.session_state:
     )
 
     if st.session_state.get("merge_trigger_auto_download", False):
-        trigger_auto_download(mres["excel_bytes"], "台鐵解款單_多檔合併完成表.xlsx")
+        trigger_auto_download(mres["excel_bytes"], "台鐵解款單_資料搬移完成表.xlsx")
         st.session_state["merge_trigger_auto_download"] = False
