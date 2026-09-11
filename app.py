@@ -635,11 +635,11 @@ if "merge_result" in st.session_state:
 
     if mres["conflict_log"]:
         st.error(f"⚠️ 發現 {len(mres['conflict_log'])} 處公版已有資料、但與來源檔案數值不同（已保留公版原值、未覆蓋），請人工核對：")
-        st.dataframe(pd.DataFrame(mres["conflict_log"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(mres["conflict_log"]).astype(str), use_container_width=True, hide_index=True)
 
     with st.expander(f"📋 查看本次搬入明細（共 {len(mres['merge_log'])} 筆）"):
         if mres["merge_log"]:
-            st.dataframe(pd.DataFrame(mres["merge_log"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(mres["merge_log"]).astype(str), use_container_width=True, hide_index=True)
         else:
             st.caption("本次沒有新增任何搬入的儲存格")
 
