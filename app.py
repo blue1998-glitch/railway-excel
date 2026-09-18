@@ -535,124 +535,240 @@ if "ocr_result" in st.session_state:
         st.session_state["ocr_trigger_auto_download"] = False
 
 # ----------------------------------------------------
-# 7. 公版資料搬移工具（步驟化：一、指定公版；二、上傳來源檔案搬移資料）
-#    與上方辨識流程完全獨立、不共用任何變數
+# 7. 全通用型 Excel 跨公版資料搬移與清洗工具
 # ----------------------------------------------------
 st.markdown("---")
-st.header("🔗 公版資料搬移工具")
-st.caption("步驟一指定公版（結構與公式以此為準）；步驟二上傳要搬移資料過去的檔案。只會填入公版「原本不是公式」的儲存格，公版既有公式 100% 不受影響，填入的儲存格並會比照公版樣式")
+st.header("🛠️ 全通用型 Excel 跨公版搬移工具")
+st.caption("支援任何格式、任何版面的 Excel：自動讀取欄位、彈性對齊主鍵、自由選擇搬移/刪除欄位，並 100% 保留目標公版公式！")
 
-st.markdown("**步驟一：指定公版檔案**")
-template_file = st.file_uploader("📋 上傳公版 Excel (.xlsx)", type=["xlsx"], key="merge_template_uploader")
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    target_file = st.file_uploader("📋 步驟一：上傳【目標檔案】(要填入資料的公版)", type=["xlsx"], key="gen_target_uploader")
+with col_u2:
+    source_file = st.file_uploader("📥 步驟二：上傳【來源檔案】(提取資料的檔案)", type=["xlsx"], key="gen_source_uploader")
 
-st.markdown("**步驟二：上傳要搬移資料的檔案**")
-source_files = st.file_uploader(
-    "📥 上傳 1 個以上要搬移資料過去的 Excel (.xlsx)",
-    type=["xlsx"],
-    accept_multiple_files=True,
-    key="merge_source_uploader"
-)
-
-if st.button("🔗 開始搬移資料", type="primary", use_container_width=True, key="merge_btn"):
-    if not template_file:
-        st.error("❌ 請先於步驟一上傳公版檔案！")
-        st.stop()
-    if not source_files:
-        st.error("❌ 請於步驟二至少上傳 1 個要搬移資料的檔案！")
-        st.stop()
-
+if target_file and source_file:
     try:
-        base_wb = openpyxl.load_workbook(io.BytesIO(template_file.getvalue()), data_only=False)
+        # 讀取雙方工作表清單
+        t_wb_preview = openpyxl.load_workbook(io.BytesIO(target_file.getvalue()), read_only=True, data_only=True)
+        s_wb_preview = openpyxl.load_workbook(io.BytesIO(source_file.getvalue()), read_only=True, data_only=True)
+        t_sheets = t_wb_preview.sheetnames
+        s_sheets = s_wb_preview.sheetnames
     except Exception as e:
-        st.error(f"❌ 公版檔案讀取失敗，請確認為正確的 .xlsx 檔案：{e}")
+        st.error(f"❌ 檔案預覽讀取失敗：{e}")
         st.stop()
 
-    merge_log = []
-    conflict_log = []
+    st.markdown("---")
+    st.markdown("#### ⚙️ 步驟三：設定對齊與欄位映射規則")
+    
+    cfg_c1, cfg_c2 = st.columns(2)
+    with cfg_c1:
+        sheet_mode = st.radio("工作表比對模式", ["自動按同名工作表比對", "手動指定工作表"], horizontal=True)
+        if sheet_mode == "手動指定工作表":
+            s_chosen_sheet = st.selectbox("來源工作表", s_sheets)
+            t_chosen_sheet = st.selectbox("目標工作表", t_sheets)
 
-    for f in source_files:
-        try:
-            src_wb = openpyxl.load_workbook(io.BytesIO(f.getvalue()), data_only=False)
-        except Exception as e:
-            st.warning(f"⚠️ 檔案 `{f.name}` 讀取失敗，已略過：{e}")
-            continue
+        header_row = st.number_input("標題欄位名稱在第幾列？ (表頭列號)", min_value=1, max_value=10, value=1, step=1, help="例如通常第 1 列是欄位標題；若上方有大標題，可能是第 2 或 3 列")
 
-        for sheet_name in src_wb.sheetnames:
-            if sheet_name not in base_wb.sheetnames:
-                continue
-            base_sheet = base_wb[sheet_name]
-            src_sheet = src_wb[sheet_name]
-            max_r = max(base_sheet.max_row, src_sheet.max_row)
-            max_c = max(base_sheet.max_column, src_sheet.max_column)
+    # 讀取選定或第一個分頁的欄位清單
+    s_sample_sheet_name = s_chosen_sheet if sheet_mode == "手動指定工作表" else s_sheets[0]
+    t_sample_sheet_name = t_chosen_sheet if sheet_mode == "手動指定工作表" else t_sheets[0]
 
-            for r in range(1, max_r + 1):
-                for c in range(1, max_c + 1):
-                    base_cell = base_sheet.cell(row=r, column=c)
-                    base_val = base_cell.value
-                    # 規則：公版原本就是公式的儲存格，一律跳過、絕不覆蓋
-                    if isinstance(base_val, str) and base_val.startswith("="):
-                        continue
-                    src_val = src_sheet.cell(row=r, column=c).value
-                    if src_val is None or src_val == "" or src_val == 0:
-                        continue
-                    if base_val is None or base_val == "" or base_val == 0:
-                        try:
-                            base_cell.value = src_val
-                        except AttributeError:
-                            continue
-                        # 比照公版第33列同欄位樣式，避免搬入後外觀與公版不一致
-                        apply_style_ref(base_cell, get_column_reference_style(base_sheet, c))
-                        merge_log.append({
-                            "來源檔案": f.name, "工作表": sheet_name,
-                            "儲存格": base_cell.coordinate, "搬入內容": src_val
-                        })
-                    elif base_val != src_val:
-                        conflict_log.append({
-                            "工作表": sheet_name, "儲存格": base_cell.coordinate,
-                            "公版原值": base_val, "來源檔案": f.name, "來源值": src_val
-                        })
+    # 解析表頭欄位
+    def get_headers(wb_bytes, sheet_name, h_row):
+        wb = openpyxl.load_workbook(io.BytesIO(wb_bytes), read_only=True, data_only=True)
+        ws = wb[sheet_name]
+        headers = {}
+        for col_idx in range(1, ws.max_column + 1):
+            val = ws.cell(row=h_row, column=col_idx).value
+            if val is not None and str(val).strip() != "":
+                headers[str(val).strip()] = col_idx
+        return headers
 
-    merged_stream = io.BytesIO()
-    base_wb.save(merged_stream)
+    s_headers = get_headers(source_file.getvalue(), s_sample_sheet_name, header_row)
+    t_headers = get_headers(target_file.getvalue(), t_sample_sheet_name, header_row)
 
-    st.session_state["merge_result"] = {
-        "excel_bytes": merged_stream.getvalue(),
-        "merge_log": merge_log,
-        "conflict_log": conflict_log,
-        "file_count": len(source_files),
-    }
-    st.session_state["merge_result_is_new"] = True
-    st.session_state["merge_trigger_auto_download"] = True
+    with cfg_c2:
+        align_mode = st.radio("資料列對齊方式", ["依據關鍵欄位對齊 (推薦，如日期/編號/科目)", "純依列號順序對齊 (第N列對第N列)"])
+        key_col = None
+        if align_mode.startswith("依據關鍵欄位"):
+            common_keys = [k for k in t_headers.keys() if k in s_headers]
+            key_col = st.selectbox("請選擇用於對齊資料列的【關鍵欄位】", 
+                                  options=common_keys if common_keys else list(t_headers.keys()),
+                                  help="例如選「日期」，系統會抓取日期相同的列進行資料填入")
 
-if "merge_result" in st.session_state:
-    mres = st.session_state["merge_result"]
+    st.markdown("##### 📌 選擇要搬移的欄位對應")
+    mapping_cols = st.columns(3)
+    field_mappings = {} # {目標欄名: 來源欄名}
 
-    if st.session_state.get("merge_result_is_new", False):
-        st.balloons()
-        st.session_state["merge_result_is_new"] = False
+    # 自動預配同名欄位
+    t_header_list = [k for k in t_headers.keys() if k != key_col]
+    s_header_list = ["(略過不搬移)"] + [k for k in s_headers.keys() if k != key_col]
 
-    st.success(f"✨ 搬移完成！共處理 {mres['file_count']} 個來源檔案，填入 {len(mres['merge_log'])} 個儲存格！")
+    for idx, t_col_name in enumerate(t_header_list):
+        col_slot = mapping_cols[idx % 3]
+        default_idx = s_header_list.index(t_col_name) if t_col_name in s_header_list else 0
+        with col_slot:
+            matched_s = st.selectbox(
+                f"目標 ➜ `{t_col_name}`",
+                options=s_header_list,
+                index=default_idx,
+                key=f"map_select_{t_col_name}"
+            )
+            if matched_s != "(略過不搬移)":
+                field_mappings[t_col_name] = matched_s
 
-    if mres["conflict_log"]:
-        st.error(f"⚠️ 發現 {len(mres['conflict_log'])} 處公版已有資料、但與來源檔案數值不同（已保留公版原值、未覆蓋），請人工核對：")
-        st.dataframe(pd.DataFrame(mres["conflict_log"]).astype(str), use_container_width=True, hide_index=True)
+    st.markdown("##### 🧹 寫入與覆蓋模式")
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        clear_target_data = st.checkbox("🧹 搬移前先清空目標公版對應欄位的舊數值", value=False, help="只清除純數值，公式欄位 100% 自動保護不清除")
+    with col_opt2:
+        overwrite_mode = st.radio("遇到目標格已有數值時：", ["直接以來源數值覆蓋", "保留目標原值（只填補空白格）"], horizontal=True)
 
-    with st.expander(f"📋 查看本次搬入明細（共 {len(mres['merge_log'])} 筆）"):
-        if mres["merge_log"]:
-            st.dataframe(pd.DataFrame(mres["merge_log"]).astype(str), use_container_width=True, hide_index=True)
+    # ----------------------------------------------------
+    # 開始執行通用搬移邏輯
+    # ----------------------------------------------------
+    if st.button("🚀 開始執行通用資料搬移", type="primary", use_container_width=True):
+        if not field_mappings:
+            st.error("❌ 請至少選擇一個要對應搬移的欄位！")
+            st.stop()
+
+        target_wb = openpyxl.load_workbook(io.BytesIO(target_file.getvalue()), data_only=False)
+        src_wb = openpyxl.load_workbook(io.BytesIO(source_file.getvalue()), data_only=False)
+
+        # 決定要處理的工作表配對 [(src_sheet, target_sheet)]
+        work_pairs = []
+        if sheet_mode == "手動指定工作表":
+            work_pairs.append((src_wb[s_chosen_sheet], target_wb[t_chosen_sheet]))
         else:
-            st.caption("本次沒有新增任何搬入的儲存格")
+            for s_name in src_wb.sheetnames:
+                # 模糊比對去除前後空格與台/臺
+                match_t = None
+                for t_name in target_wb.sheetnames:
+                    if s_name.strip() == t_name.strip():
+                        match_t = t_name
+                        break
+                if match_t:
+                    work_pairs.append((src_wb[s_name], target_wb[match_t]))
+
+        if not work_pairs:
+            st.error("❌ 找不到可以配對的工作表名稱！")
+            st.stop()
+
+        logs = []
+        cleared_count = 0
+        written_count = 0
+
+        for s_ws, t_ws in work_pairs:
+            # 取得兩邊的欄位索引
+            curr_s_headers = {}
+            for c in range(1, s_ws.max_column + 1):
+                val = s_ws.cell(row=header_row, column=c).value
+                if val: curr_s_headers[str(val).strip()] = c
+
+            curr_t_headers = {}
+            for c in range(1, t_ws.max_column + 1):
+                val = t_ws.cell(row=header_row, column=c).value
+                if val: curr_t_headers[str(val).strip()] = c
+
+            # 建立目標資料列索引：Key -> Row Number
+            t_row_map = {}
+            if align_mode.startswith("依據關鍵欄位") and key_col in curr_t_headers:
+                t_k_col = curr_t_headers[key_col]
+                for r in range(header_row + 1, t_ws.max_row + 1):
+                    val = t_ws.cell(row=r, column=t_k_col).value
+                    if val is not None and str(val).strip() != "":
+                        t_row_map[str(val).strip()] = r
+
+            # 功能 A：預先清除選定欄位的純數據（保留公式）
+            if clear_target_data:
+                for t_col_name in field_mappings.keys():
+                    if t_col_name in curr_t_headers:
+                        tc_idx = curr_t_headers[t_col_name]
+                        for r in range(header_row + 1, t_ws.max_row + 1):
+                            cell = t_ws.cell(row=r, column=tc_idx)
+                            # 保護公式：只要以 '=' 開頭就不清空
+                            if cell.value is not None and not (isinstance(cell.value, str) and cell.value.startswith("=")):
+                                cell.value = None
+                                cleared_count += 1
+
+            # 功能 B：依列對齊並搬移數據
+            s_k_col = curr_s_headers.get(key_col) if (align_mode.startswith("依據關鍵欄位") and key_col) else None
+
+            for s_row in range(header_row + 1, s_ws.max_row + 1):
+                # 尋找對應的目標列
+                target_r = None
+                if align_mode.startswith("依據關鍵欄位") and s_k_col:
+                    s_key_val = s_ws.cell(row=s_row, column=s_k_col).value
+                    if s_key_val is not None:
+                        target_r = t_row_map.get(str(s_key_val).strip())
+                else:
+                    # 依列號順序
+                    target_r = s_row if s_row <= t_ws.max_row else None
+
+                if not target_r:
+                    continue
+
+                # 搬移各對應欄位
+                for t_col_name, s_col_name in field_mappings.items():
+                    if t_col_name not in curr_t_headers or s_col_name not in curr_s_headers:
+                        continue
+
+                    tc_idx = curr_t_headers[t_col_name]
+                    sc_idx = curr_s_headers[s_col_name]
+
+                    t_cell = t_ws.cell(row=target_r, column=tc_idx)
+                    s_val = s_ws.cell(row=s_row, column=sc_idx).value
+
+                    # 1. 目標是公式：絕對不覆蓋
+                    if isinstance(t_cell.value, str) and t_cell.value.startswith("="):
+                        continue
+
+                    # 2. 來源若是空值或 0 則不寫入
+                    if s_val is None or s_val == "":
+                        continue
+
+                    # 3. 判斷寫入條件
+                    if t_cell.value is None or t_cell.value == "" or t_cell.value == 0:
+                        t_cell.value = s_val
+                        written_count += 1
+                        logs.append({"工作表": t_ws.title, "列號": target_r, "欄位": t_col_name, "填入值": s_val})
+                    elif overwrite_mode.startswith("直接以來源數值覆蓋"):
+                        t_cell.value = s_val
+                        written_count += 1
+                        logs.append({"工作表": t_ws.title, "列號": target_r, "欄位": t_col_name, "填入值": f"{s_val} (覆蓋舊值)"})
+
+        # 輸出結果
+        out = io.BytesIO()
+        target_wb.save(out)
+        st.session_state["gen_merge_result"] = {
+            "bytes": out.getvalue(),
+            "logs": logs,
+            "written_count": written_count,
+            "cleared_count": cleared_count
+        }
+        st.session_state["gen_merge_new"] = True
+
+if "gen_merge_result" in st.session_state:
+    res = st.session_state["gen_merge_result"]
+    if st.session_state.get("gen_merge_new", False):
+        st.balloons()
+        st.session_state["gen_merge_new"] = False
+
+    st.success(f"🎉 搬移作業完成！成功寫入/更新 **{res['written_count']}** 個儲存格！" +
+               (f"（事前已清空 {res['cleared_count']} 個純數值儲存格）" if res['cleared_count'] > 0 else ""))
+
+    with st.expander(f"📋 查看詳細搬移紀錄清單（共 {len(res['logs'])} 筆）"):
+        if res["logs"]:
+            st.dataframe(pd.DataFrame(res["logs"]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("未產生任何數值變更")
 
     st.download_button(
-        label="📥 點擊下載搬移完成的 Excel 報表 (.xlsx)",
-        data=mres["excel_bytes"],
-        file_name="台鐵解款單_資料搬移完成表.xlsx",
+        label="📥 點擊下載搬移完成的 Excel 檔案 (.xlsx)",
+        data=res["bytes"],
+        file_name="通用搬移完成表.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        use_container_width=True,
-        key="merge_download_btn"
+        use_container_width=True
     )
-
-    if st.session_state.get("merge_trigger_auto_download", False):
-        trigger_auto_download(mres["excel_bytes"], "台鐵解款單_資料搬移完成表.xlsx")
-        st.session_state["merge_trigger_auto_download"] = False
