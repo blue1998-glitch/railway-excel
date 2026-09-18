@@ -534,7 +534,7 @@ if "ocr_result" in st.session_state:
         trigger_auto_download(res["excel_bytes"], "台鐵解款單_彙總完成表.xlsx")
         st.session_state["ocr_trigger_auto_download"] = False
 
-# ---# ----------------------------------------------------
+# ----------------------------------------------------
 # 7. 全通用型 Excel 跨公版資料搬移與清洗工具 (修復欄位抓取版)
 # ----------------------------------------------------
 st.markdown("---")
