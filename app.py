@@ -39,15 +39,12 @@ with st.sidebar:
     # 「多模態 PDF 辨識 + 結構化 JSON 輸出」且屬穩定版（非 preview/experimental）的 Flash / Flash-Lite
     # 主流模型，優先選用免費額度 RPM 較高的機型。日後 Google 更新模型時，只需增減下方字串即可，
     # 不必更動其他程式邏輯。
-    MODEL_WHITELIST = [
-        "gemini-3.6-flash",           # 已實測穩定可用
-        "gemini-flash-lite-latest",   # 已實測穩定可用（官方別名，恆指向最新穩定版 Flash-Lite）
-        "gemini-flash-latest",        # 新增：官方別名，恆指向最新穩定版 Flash（尚待實測）
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.7-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
+        MODEL_WHITELIST = [
+        "gemini-3.8-flash",           # 目前 Google 官方最新的旗艦 Flash 模型（效能最好、強烈建議預設使用）
+        "gemini-3.7-flash",           # 具備高精準文件辨識與結構化輸出能力的穩定版
+        "gemini-flash-latest",        # 官方動態別名，恆指向最新穩定版 Flash（系統會自動對應當前最新）
+        "gemini-3.5-flash-lite",      # 輕量高速版，適合高通量請求
+        "gemini-flash-lite-latest",   # 官方動態別名，恆指向最新穩定版 Flash-Lite
     ]
 
     selected_model = st.selectbox(
