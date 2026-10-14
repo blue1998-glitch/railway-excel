@@ -45,6 +45,7 @@ with st.sidebar:
         "gemini-flash-latest",        # 官方動態別名，恆指向最新穩定版 Flash（系統會自動對應當前最新）
         "gemini-3.5-flash-lite",      # 輕量高速版，適合高通量請求
         "gemini-flash-lite-latest",   # 官方動態別名，恆指向最新穩定版 Flash-Lite
+        "gemini-3.1-flash-lite",
     ]
 
     selected_model = st.selectbox(
